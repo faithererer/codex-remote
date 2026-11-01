@@ -22,6 +22,92 @@ static class SelfTests
         Test("Bounded event overflow requires resync", () => { var events = new EventHub(); var old = events.InstanceId; for (int i = 0; i < 300; i++) events.Publish("event", new { }); var sub = events.Subscribe(old, 1); Check(sub.Replay[0].S("type") == "reset"); events.Remove(sub.Channel); });
         Test("Pairing one-use and revocation", () => { var pairing = new Pairing(vault, Identity.Load(vault)) { Confirm = _ => Task.FromResult(true) }; var qr = JsonNode.Parse(pairing.CreateQr("https://100.64.1.1:48761"))!; var request = J.Node(new { secret = qr.S("secret"), deviceName = "test" }); var paired = J.Node(pairing.Pair(request).GetAwaiter().GetResult()); Check(pairing.Authenticate(paired.S("token")) != null); try { pairing.Pair(request).GetAwaiter().GetResult(); throw new Exception("Replay accepted"); } catch (ApiError) { } pairing.Revoke(paired.S("deviceId")); Check(pairing.Authenticate(paired.S("token")) == null); });
         Test("Unknown pairing rejected", () => { var pairing = new Pairing(vault, Identity.Load(vault)); try { pairing.Pair(J.Node(new { deviceName = "test", secret = new string('0', 64) })).GetAwaiter().GetResult(); throw new Exception("Unauthenticated device accepted"); } catch (ApiError e) { Check(e.Status == 403); } });
+        Test("Runtime handshake depends on protocol not desktop version or archive hash", () => {
+            var schema = JsonNode.Parse("""{"type":"object","properties":{"limit":{"type":"integer"}},"additionalProperties":false}""")!;
+            Check(Compatibility.HandshakeReady(Guid.NewGuid().ToString(), schema));
+            Check(!Compatibility.HandshakeReady("invalid-handshake", schema));
+            Check(!Compatibility.HandshakeReady(Guid.NewGuid().ToString(), JsonNode.Parse("""{"type":"object","required":["unsupportedNewArgument"]}""")));
+        });
+        Test("Only explicit pre-dispatch router rejections are safe to reject without uncertainty", () => {
+            foreach (var error in new[] { "no-client-found", "no-handler-for-request", "request-version-mismatch" }) Check(Compatibility.RouterRejectedBeforeDispatch(error));
+            foreach (var error in new[] { "timeout", "server-closed", "no-client-found: owner became unavailable", "rollback failed" }) Check(!Compatibility.RouterRejectedBeforeDispatch(error));
+        });
+        Test("Native schema drift disables only arguments that do not match", () => {
+            var schema = JsonNode.Parse("""{"type":"object","required":["environment"],"properties":{"environment":{"anyOf":[{"type":"object","required":["type"],"properties":{"type":{"const":"same-directory"}},"additionalProperties":false},{"type":"object","required":["type"],"properties":{"type":{"const":"worktree"}},"additionalProperties":false}]}},"additionalProperties":false}""")!;
+            Check(Compatibility.Matches(schema, J.Node(new { environment = new { type = "same-directory" } })));
+            Check(!Compatibility.Matches(schema, J.Node(new { environment = new { type = "new-unsupported-mode" } })));
+            Check(!Compatibility.Matches(schema, J.Node(new { environment = new { type = "worktree" }, permissions = "forbidden" })));
+            Check(!Compatibility.Matches(JsonNode.Parse("""{"$ref":"unknown-contract"}"""), J.Node(new { })));
+        });
+        Test("Live state validation rejects unknown turn or history schemas per operation", () => {
+            var state = JsonNode.Parse("""{"id":"t","hostId":"local","requests":[],"turns":[{"turnId":"a","status":"completed","params":{},"items":[]}]}""")!;
+            Compatibility.ValidateState(state, "t"); state["turns"]![0]!["status"] = "new-unknown-status";
+            try { Compatibility.ValidateState(state, "t"); throw new Exception("Unknown running state accepted"); } catch (ApiError) { }
+            state["turns"]![0]!["status"] = "completed"; state["threadRuntimeStatus"] = J.Node(new { type = "active" });
+            try { Compatibility.ValidateState(state, "t"); throw new Exception("Unloaded active turn accepted"); } catch (ApiError) { }
+            state["threadRuntimeStatus"] = null; state["hostId"] = "remote";
+            try { Compatibility.ValidateState(state, "t"); throw new Exception("Foreign state accepted"); } catch (ApiError) { }
+        });
+        JsonNode EditState() => JsonNode.Parse("""{"id":"thread-a","latestModel":"a","modelProvider":"provider-a","latestReasoningEffort":"high","requests":[],"turns":[{"turnId":"turn-a","status":"completed","params":{"clientUserMessageId":"c-a","useAppServerPermissionDefault":true,"input":[{"type":"text","text":"original"}]},"items":[{"type":"userMessage","clientId":"c-a","text":"original"},{"type":"agentMessage","phase":"final_answer","text":"done"}]}]}""")!;
+        Test("Native editing targets only the latest message and never overrides permissions", () => {
+            var state = EditState(); var target = ThreadSettings.EditTarget(state);
+            var args = ThreadSettings.EditArguments(state, J.Node(new { editTurnId = "turn-a", editFingerprint = target.S("fingerprint"), text = "edited" }));
+            Check(args.S("turnId") == "turn-a" && args.S("message") == "edited" && args["allowEarlierMessages"]!.GetValue<bool>() == false && args["shouldSendPermissionOverrides"]!.GetValue<bool>() == false && args["sandboxPolicy"] == null);
+        });
+        Test("Edit rejects stale message fingerprint and latest turn", () => {
+            var state = EditState(); var target = ThreadSettings.EditTarget(state);
+            foreach (var body in new[] { J.Node(new { editTurnId = "turn-a", editFingerprint = "stale", text = "edited" }), J.Node(new { editTurnId = "turn-b", editFingerprint = target.S("fingerprint"), text = "edited" }) })
+                try { ThreadSettings.EditArguments(state, body); throw new Exception("Stale edit accepted"); } catch (ApiError e) { Check(e.Status == 409); }
+        });
+        Test("Running turns pending approvals and later steering block editing", () => {
+            var state = EditState(); state["turns"]![0]!["status"] = "inProgress"; Check(ThreadSettings.EditTarget(state)["allowed"]!.GetValue<bool>() == false);
+            state["turns"]![0]!["status"] = "completed"; state["requests"]!.AsArray().Add(J.Node(new { id = "approval" })); Check(!ThreadSettings.EditTarget(state)["allowed"]!.GetValue<bool>());
+            state["requests"]!.AsArray().Clear(); state["turns"]![0]!["items"]!.AsArray().Add(J.Node(new { type = "steeringUserMessage", text = "later" })); Check(!ThreadSettings.EditTarget(state)["allowed"]!.GetValue<bool>());
+        });
+        Test("Editing refuses attachments and structured desktop context", () => {
+            var state = EditState(); state["turns"]![0]!["params"]!["input"]!.AsArray().Add(J.Node(new { type = "localImage", path = "test" })); Check(!ThreadSettings.EditTarget(state)["allowed"]!.GetValue<bool>());
+            state = EditState(); state["turns"]![0]!["params"]!["input"]![0]!["text"] = "## My request:\noriginal"; Check(!ThreadSettings.EditTarget(state)["allowed"]!.GetValue<bool>());
+        });
+        Test("Editing custom permissions stays on the desktop", () => {
+            var state = EditState(); state["turns"]![0]!["params"]!["useAppServerPermissionDefault"] = false;
+            Check(!ThreadSettings.EditTarget(state)["allowed"]!.GetValue<bool>() && ThreadSettings.EditTarget(state).S("reason").Contains("权限"));
+        });
+        Test("Only configured provider catalog reaches model picker", () => {
+            var state = EditState(); var config = JsonNode.Parse("""{"models":[{"slug":"b","display_name":"B","visibility":"list","supported_reasoning_levels":[{"effort":"low"}]},{"slug":"hidden","visibility":"hide"}]}""")!;
+            var choices = ThreadSettings.Catalog(state, config, true); Check(choices.Count == 2 && choices[0].S("id") == "b");
+            Check(ThreadSettings.Catalog(state, config, false).Count == 1 && ThreadSettings.Catalog(state, config, false)[0].S("id") == "a");
+        });
+        Test("Model update uses conditional native settings without touching permissions", () => {
+            var state = EditState(); var choices = new JsonArray(J.Node(new { id = "b", efforts = new[] { "low" } }));
+            var args = ThreadSettings.ModelArguments(state, J.Node(new { model = "b", effort = "low", expectedModel = "a", expectedEffort = "high", expectedProvider = "provider-a" }), choices);
+            Check(args["threadSettings"]!.AsObject().Count == 2 && args["threadSettings"].S("model") == "b" && args["condition"].S("ifModelEquals") == "a" && args["activeTurnId"] == null);
+        });
+        Test("Model update rejects foreign models stale providers and unsupported effort", () => {
+            var state = EditState(); var choices = ThreadSettings.Catalog(state, null, false);
+            var body = J.Node(new { model = "a", effort = "high", expectedModel = "a", expectedEffort = "high", expectedProvider = "provider-a" });
+            foreach (var pair in new[] { ("model", "foreign"), ("effort", "ultra"), ("expectedProvider", "provider-b"), ("expectedModel", "stale") }) {
+                var bad = body.Copy(); bad[pair.Item1] = pair.Item2;
+                try { ThreadSettings.ModelArguments(state, bad, choices); throw new Exception("Invalid model update accepted"); } catch (ApiError) { }
+            }
+        });
+        Test("Completed response includes phase and real turn status", () => {
+            var state = EditState(); var view = StateView.Normalize(state, "instance"); var answer = view.Array("messages").First(i => i.S("kind") == "agentMessage");
+            Check(answer.S("phase") == "final_answer" && answer.S("turnStatus") == "completed" && view.S("latestTurnId") == "turn-a" && view.S("status") == "completed");
+        });
+        Test("Catalog discovery handles TOML profile and rejects mismatched provider or scoped config", () => {
+            var home = Path.Combine(root, "catalog-test"); Directory.CreateDirectory(home);
+            var config = Path.Combine(home, "config.toml"); File.WriteAllText(config, "model_provider = \"wrong\"\nprofile = \"phone\"\n[profiles.phone]\nmodel_provider = \"provider-a\"\nmodel_catalog_json = \"models.json\"\n");
+            File.WriteAllText(Path.Combine(home, "models.json"), "{\"models\":[]}");
+            var old = Environment.GetEnvironmentVariable("CODEX_HOME");
+            try {
+                Environment.SetEnvironmentVariable("CODEX_HOME", home);
+                var state = EditState(); state["cwd"] = home;
+                Check(ThreadSettings.ReadCatalog(state).Matches);
+                state["modelProvider"] = "other"; Check(!ThreadSettings.ReadCatalog(state).Matches);
+                state["modelProvider"] = "provider-a"; Directory.CreateDirectory(Path.Combine(home, ".codex")); File.WriteAllText(Path.Combine(home, ".codex", "config.toml"), "model = \"scoped\"");
+                Check(!ThreadSettings.ReadCatalog(state).Matches);
+            } finally { Environment.SetEnvironmentVariable("CODEX_HOME", old); }
+        });
         Test("Native initial echo replaces fallback with stable message identity", () => {
             var state = JsonNode.Parse("""{"turns":[{"turnId":"t","params":{"clientUserMessageId":"client-1","input":[{"type":"text","text":"same request"}]},"items":[]}]}""")!;
             var fallback = StateView.Normalize(state, "i").Array("messages")[0]!;

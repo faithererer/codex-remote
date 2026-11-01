@@ -29,7 +29,7 @@ static class Program
         ApplicationConfiguration.Initialize();
         try
         {
-            var vault = new Vault(data); var identity = Identity.Load(vault); var pairing = new Pairing(vault, identity); var events = new EventHub(); var desktop = new Desktop(events);
+            var vault = new Vault(data); var identity = Identity.Load(vault); var pairing = new Pairing(vault, identity); var events = new EventHub(); var desktop = new Desktop(events, vault);
             using var cancel = new CancellationTokenSource();
             using var window = new MainWindow(identity, pairing, desktop, vault);
             pairing.Confirm = name => window.ConfirmPair(name);
@@ -83,11 +83,12 @@ static class Program
             if (body.S("hostId") != identity.HostId) throw new ApiError(409, "电脑身份不匹配");
             return Results.Json(await pairing.Pair(body));
         });
-        app.MapGet("/api/v1/status", () => new { hostId = identity.HostId, instanceId = events.InstanceId, name = identity.Name, desktopConnected = desktop.Connected, compatible = desktop.Compatible, desktopVersion = desktop.Version, error = desktop.LastError, protocolVersion = 1 });
+        app.MapGet("/api/v1/status", () => new { hostId = identity.HostId, instanceId = events.InstanceId, name = identity.Name, desktopConnected = desktop.Connected, compatible = desktop.Compatible, desktopVersion = desktop.Version, knownBuild = desktop.KnownBuild, compatibilityMode = "runtime-protocol", compatibilityNote = desktop.CompatibilityNote, error = desktop.LastError, protocolVersion = 1 });
         app.MapGet("/api/v1/threads", async () => new { hostId = identity.HostId, instanceId = events.InstanceId, threads = await desktop.Catalog() });
         app.MapGet("/api/v1/projects", async () => new { hostId = identity.HostId, instanceId = events.InstanceId, projects = await desktop.Projects(), defaultLocation = "Codex 默认目录（由电脑创建独立工作目录）" });
         app.MapGet("/api/v1/threads/{id}", async (string id) => await desktop.History(id));
         app.MapGet("/api/v1/threads/{id}/fork-context", async (string id) => { var context = await desktop.ForkContext(id); context["hostId"] = identity.HostId; return context; });
+        app.MapGet("/api/v1/threads/{id}/models", async (string id) => { var models = await desktop.Models(id); models["hostId"] = identity.HostId; return models; });
         app.MapGet("/api/v1/operations/{id}", (string id) => operations.Lookup(id) is JsonNode value ? Results.Json(value) : Results.NotFound(new { status = "notFound", warning = "未记录并不代表可以自动重发；请核对会话" }));
         app.MapPost("/api/v1/operations", async (JsonNode body) =>
         {
@@ -139,7 +140,15 @@ static class Program
     static async Task<JsonNode> Smoke()
     {
         var hub = new EventHub(); await using var desktop = new Desktop(hub); var stopwatch = Stopwatch.StartNew();
-        try { var catalog = await desktop.Catalog(); var active = catalog.OfType<JsonNode>().FirstOrDefault(n => n.S("status") == "active") ?? catalog.FirstOrDefault(); var state = active == null ? null : await desktop.Snapshot(active.S("id"), true); return J.Node(new { success = true, desktop.Compatible, desktop.Version, threadCount = catalog.Count, originalDesktopStateRead = state != null, turnCount = state == null ? 0 : StateView.Turns(state).Count(), desktopRequestsReadable = state?["requests"] is JsonArray, modelPreserved = state?.S("latestModel").Length > 0, permissionSettingsPresent = state?["currentPermissions"] != null, elapsedMs = stopwatch.ElapsedMilliseconds, commandsSent = 0, twoPcAccepted = false, phoneAccepted = false }); }
+        try
+        {
+            var catalog = await desktop.Catalog();
+            var active = catalog.OfType<JsonNode>().FirstOrDefault(n => n.S("status") == "active") ?? catalog.FirstOrDefault();
+            var state = active == null ? null : await desktop.Snapshot(active.S("id"), true);
+            if (state != null) Compatibility.ValidateState(state, active!.S("id"));
+            var models = active == null ? null : await desktop.Models(active.S("id"));
+            return J.Node(new { success = true, desktop.Compatible, desktop.Version, desktop.KnownBuild, compatibilityMode = "runtime-protocol", threadCount = catalog.Count, originalDesktopStateRead = state != null, nativeStateSchemaValidated = state != null, turnCount = state == null ? 0 : StateView.Turns(state).Count(), desktopRequestsReadable = state?["requests"] is JsonArray, modelPreserved = state?.S("latestModel").Length > 0, permissionSettingsPresent = state?["currentPermissions"] != null, modelChoiceCount = models.Array("models").Count, modelSettingsReadOnly = true, elapsedMs = stopwatch.ElapsedMilliseconds, commandsSent = 0, twoPcAccepted = false, phoneAccepted = false });
+        }
         catch (Exception e) { return J.Node(new { success = false, error = e.Message }); }
     }
     static async Task PhoneTest(string output)
@@ -195,7 +204,7 @@ sealed class MainWindow : Form
         var menu = new ContextMenuStrip(); menu.Items.Add("显示配对窗口", null, (_, _) => ShowWindow()); menu.Items.Add("退出桥接", null, (_, _) => { exiting = true; Close(); }); tray.ContextMenuStrip = menu; tray.DoubleClick += (_, _) => ShowWindow();
         Shown += (_, _) => { RefreshPair(); RefreshDevices(); }; FormClosing += (_, e) => { if (!exiting && e.CloseReason == CloseReason.UserClosing) { e.Cancel = true; Hide(); } };
         pairing.Changed += () => { if (IsHandleCreated) BeginInvoke(RefreshDevices); };
-        timer.Tick += (_, _) => { address.Text = Endpoint.Length == 0 ? "未发现 Tailscale 地址：请连接 Tailscale 后退出并重开桥接。" : Endpoint + " · 配对码剩余 " + Math.Max(0, (int)(expires - DateTimeOffset.UtcNow).TotalSeconds) + " 秒"; status.Text = failure.Length > 0 ? failure : desktop.Connected ? (desktop.Compatible ? "已接入原 Codex 桌面实例 · 未修改 CLI、账号、工具或权限\n" : "桌面已连接，但版本未经验证，远程控制已锁定\n") + desktop.LastError : desktop.LastError; if (DateTimeOffset.UtcNow >= expires && qr.Image != null) { qr.Image.Dispose(); qr.Image = null; code = ""; } }; timer.Start();
+        timer.Tick += (_, _) => { address.Text = Endpoint.Length == 0 ? "未发现 Tailscale 地址：请连接 Tailscale 后退出并重开桥接。" : Endpoint + " · 配对码剩余 " + Math.Max(0, (int)(expires - DateTimeOffset.UtcNow).TotalSeconds) + " 秒"; status.Text = failure.Length > 0 ? failure : desktop.Connected ? (desktop.Compatible ? "已接入原 Codex 桌面实例 · " + desktop.CompatibilityNote + "\n" : "桌面已连接，正在检查原生协议\n") + desktop.LastError : desktop.LastError; if (DateTimeOffset.UtcNow >= expires && qr.Image != null) { qr.Image.Dispose(); qr.Image = null; code = ""; } }; timer.Start();
     }
     void ShowWindow() { Show(); WindowState = FormWindowState.Normal; Activate(); }
     public void SetError(string value) { if (IsHandleCreated) BeginInvoke(() => { failure = value; }); }

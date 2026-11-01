@@ -117,7 +117,7 @@ private fun Console(repo: Repository, incoming: ThreadKey?, consumeIncoming: () 
                 "hosts" -> HostsScreen(hosts.values.toList(), repo, { screen = "pair" })
                 "create" -> NewThreadScreen(hosts.values.filter { it.host.followed }, repo, createHost, { key -> selected = key; screen = "thread" }, { screen = "home" })
                 "thread" -> selected?.let { key -> ThreadScreen(key, repo, hosts[key.hostId]) }
-                else -> HomeScreen(hosts.values.toList(), background, monitor, { screen = "pair" }, { id -> createHost = id; screen = "create" }, { key -> selected = key; screen = "thread" })
+                else -> HomeScreen(hosts.values.toList(), repo, background, monitor, { screen = "pair" }, { id -> createHost = id; screen = "create" }, { key -> selected = key; screen = "thread" })
             }
         }
     }
@@ -125,8 +125,9 @@ private fun Console(repo: Repository, incoming: ThreadKey?, consumeIncoming: () 
 }
 
 @Composable
-private fun HomeScreen(hosts: List<HostState>, background: Boolean, monitor: () -> Unit, add: () -> Unit, create: (String) -> Unit, open: (ThreadKey) -> Unit) {
-    var filter by rememberSaveable { mutableStateOf("") }; var attention by rememberSaveable { mutableStateOf(false) }
+private fun HomeScreen(hosts: List<HostState>, repo: Repository, background: Boolean, monitor: () -> Unit, add: () -> Unit, create: (String) -> Unit, open: (ThreadKey) -> Unit) {
+    val selection by repo.homeSelection.collectAsState(); val unread by repo.unreadCompletions.collectAsState()
+    val filter = selection.hostId; val attention = selection.attention
     val followed = hosts.filter { it.host.followed }
     val tasks = followed.filter { filter.isEmpty() || filter == it.host.id }.flatMap { h -> h.threads.map { h to it } }.filter { !attention || it.second.optString("status") in listOf("active", "needsInput") }.sortedByDescending { it.second.optString("updatedAt") }
     LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(start = 14.dp, end = 14.dp, bottom = 18.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -146,13 +147,13 @@ private fun HomeScreen(hosts: List<HostState>, background: Boolean, monitor: () 
         }
         item {
             Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                FilterChip(selected = filter.isEmpty(), onClick = { filter = "" }, label = { Text("全部关注") })
-                followed.forEach { h -> FilterChip(selected = filter == h.host.id, onClick = { filter = h.host.id }, label = { Text((if (h.online) "● " else "○ ") + h.host.name) }) }
+                FilterChip(selected = filter.isEmpty(), onClick = { repo.selectHome(selection.copy(hostId = "")) }, label = { Text("全部关注") })
+                followed.forEach { h -> FilterChip(selected = filter == h.host.id, onClick = { repo.selectHome(selection.copy(hostId = h.host.id)) }, label = { Text((if (h.online) "● " else "○ ") + h.host.name) }) }
                 AssistChip(onClick = add, label = { Text("添加") }, leadingIcon = { Icon(Icons.Outlined.Add, null, Modifier.size(16.dp)) })
             }
         }
         item { Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) { Text("任务看板", style = MaterialTheme.typography.titleLarge, modifier = Modifier.weight(1f)); if (followed.isNotEmpty()) FilledTonalButton(onClick = { create(filter) }, contentPadding = PaddingValues(horizontal = 12.dp, vertical = 5.dp)) { Icon(Icons.Outlined.Add, null, Modifier.size(16.dp)); Text("新建会话", fontSize = 12.sp) } } }
-        if (tasks.isNotEmpty()) item { FilterChip(selected = attention, onClick = { attention = !attention }, label = { Text("只看运行 / 待处理") }) }
+        if (tasks.isNotEmpty() || attention) item { FilterChip(selected = attention, onClick = { repo.selectHome(selection.copy(attention = !attention)) }, label = { Text("只看运行 / 待处理") }) }
         followed.filter { !it.online }.forEach { h -> item(key = "offline-${h.host.id}") { Surface(color = Color(0xFFFFE9CF), shape = RoundedCornerShape(14.dp)) { Column(Modifier.fillMaxWidth().padding(14.dp)) { Text("${h.host.name} · 暂未连接", fontWeight = FontWeight.Bold); Text(h.error, style = MaterialTheme.typography.bodySmall); Text("不会把指令转发到其他电脑。", style = MaterialTheme.typography.bodySmall) } } } }
         if (hosts.isEmpty()) item { EmptyState("从第一台电脑开始", "在 Windows 上运行桥接程序，然后扫码。每台电脑独立连接，互不影响。", add) }
         else if (tasks.isEmpty()) item { Column(Modifier.fillMaxWidth().padding(vertical = 24.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) { Text(if (attention) "暂时没有运行或待处理任务" else "从新会话开始", style = MaterialTheme.typography.titleLarge); Text("可以在手机选择电脑和工作位置，直接发送首条指令。", color = Color(0xFF667268)); OutlinedButton(onClick = { create(filter) }) { Text("新建会话") } } }
@@ -160,7 +161,7 @@ private fun HomeScreen(hosts: List<HostState>, background: Boolean, monitor: () 
             Card(onClick = { open(ThreadKey(h.host.id, t.optString("id"))) }, colors = CardDefaults.cardColors(containerColor = Color.White), shape = RoundedCornerShape(18.dp)) {
                 Column(Modifier.fillMaxWidth().padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                     Row(verticalAlignment = Alignment.CenterVertically) { Text(h.host.name, fontFamily = FontFamily.Monospace, fontSize = 12.sp, color = Forest, modifier = Modifier.weight(1f)); StatusPill(t.optString("status")) }
-                    Text(t.optString("title", "未命名会话"), maxLines = 2, overflow = TextOverflow.Ellipsis, fontWeight = FontWeight.SemiBold, fontSize = 16.sp)
+                    Row(verticalAlignment = Alignment.CenterVertically) { if (unread.containsKey(ThreadKey(h.host.id, t.optString("id")))) { CompletionDot("有新的已完成回复"); Spacer(Modifier.width(7.dp)) }; Text(t.optString("title", "未命名会话"), maxLines = 2, overflow = TextOverflow.Ellipsis, fontWeight = FontWeight.SemiBold, fontSize = 16.sp) }
                     val summary = t.optString("summary"); if (summary.isNotEmpty()) Text(summary, maxLines = 2, overflow = TextOverflow.Ellipsis, color = Color(0xFF667268), fontSize = 13.sp)
                 }
             }
@@ -202,14 +203,15 @@ private fun ThreadScreen(key: ThreadKey, repo: Repository, host: HostState?) {
     val histories by repo.histories.collectAsState(); val view = histories[key]; val scope = rememberCoroutineScope()
     var draft by remember(key) { mutableStateOf(repo.draft(key)) }; var busy by remember(key) { mutableStateOf(false) }; var stopConfirm by remember { mutableStateOf(false) }
     var latestRequest by remember(key) { mutableIntStateOf(0) }
+    var modelDialog by remember(key) { mutableStateOf(false) }; var editTarget by remember(key) { mutableStateOf<JSONObject?>(null) }
     DisposableEffect(key) { repo.watch(key); onDispose { repo.unwatch(key) } }
     val active = view?.optString("activeTurnId").orEmpty(); val live = view?.optBoolean("live", true) == true
     val enabled = host?.online == true && host.compatible && view != null && live && !busy
-    fun operate(type: String, fields: JSONObject = JSONObject()) {
+    fun operate(type: String, fields: JSONObject = JSONObject(), success: () -> Unit = {}) {
         if (busy) return
         busy = true
         scope.launch {
-            try { repo.message.value = repo.operate(key, type, fields); if (type == "send" || type == "steer") { if (draft == fields.optString("text")) { draft = ""; repo.draft(key, "") }; latestRequest++ } }
+            try { repo.message.value = repo.operate(key, type, fields); if (type == "send" || type == "steer") { if (draft == fields.optString("text")) { draft = ""; repo.draft(key, "") }; latestRequest++ }; if (type == "edit") latestRequest++; success() }
             catch (e: Exception) { repo.message.value = e.message ?: "未能发送；请刷新核对" }
             finally { busy = false }
         }
@@ -219,16 +221,22 @@ private fun ThreadScreen(key: ThreadKey, repo: Repository, host: HostState?) {
             if (!live) TextButton(onClick = { operate("activate") }, enabled = host?.online == true && host.compatible && !busy) { Text("在电脑打开这个现有会话并接入", fontSize = 12.sp) }
             if (host?.online != true) Text("电脑离线：仅保存草稿，不会排队发送", color = Color(0xFF9A4F17), fontSize = 11.sp)
         }
-        ConversationTimeline(key, view, Modifier.weight(1f), latestRequest) { request -> RequestCard(request, enabled, { fields -> operate("decision", fields) }, { fields -> operate("answer", fields) }) }
+        ConversationTimeline(key, view, Modifier.weight(1f), latestRequest, { turn -> repo.markRead(key, turn) }) { request -> RequestCard(request, enabled, { fields -> operate("decision", fields) }, { fields -> operate("answer", fields) }) }
         Column(Modifier.fillMaxWidth().background(Paper).imePadding().padding(horizontal = 10.dp, vertical = 5.dp)) {
             LatestFilesButton(view)
             LatestThought(view, active.isNotEmpty(), enabled) { stopConfirm = true }
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                TextButton(onClick = { modelDialog = true }, enabled = enabled, contentPadding = PaddingValues(horizontal = 5.dp, vertical = 0.dp), modifier = Modifier.heightIn(min = 32.dp).weight(1f)) { Text(view?.optString("model")?.substringAfterLast('/')?.ifBlank { "选择模型" } ?: "选择模型", fontSize = 11.sp, maxLines = 1, overflow = TextOverflow.Ellipsis); Icon(Icons.Outlined.ExpandMore, "切换模型", Modifier.size(15.dp)) }
+                TextButton(onClick = { editTarget = view?.optJSONObject("editTarget")?.let { JSONObject(it.toString()).put("instanceId", view.optString("instanceId")) } }, enabled = enabled && view?.optJSONObject("editTarget") != null, contentPadding = PaddingValues(horizontal = 5.dp, vertical = 0.dp), modifier = Modifier.heightIn(min = 32.dp)) { Icon(Icons.Outlined.Edit, null, Modifier.size(13.dp)); Text("编辑最新消息", fontSize = 11.sp) }
+            }
             Row(verticalAlignment = Alignment.Bottom, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 OutlinedTextField(draft, { draft = it; repo.draft(key, it) }, placeholder = { Text(if (active.isNotEmpty()) "追加指示…" else "发送指令…", fontSize = 14.sp) }, textStyle = MaterialTheme.typography.bodyMedium, modifier = Modifier.weight(1f).heightIn(max = 120.dp), shape = RoundedCornerShape(14.dp), maxLines = 4)
                 FilledIconButton(onClick = { operate(if (active.isEmpty()) "send" else "steer", JSONObject().put("text", draft)) }, enabled = enabled && draft.isNotBlank(), modifier = Modifier.size(48.dp)) { if (busy) CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp) else Icon(Icons.AutoMirrored.Outlined.Send, "发送") }
             }
         }
     }
+    if (modelDialog) ModelDialog(key, host, repo, enabled, { modelDialog = false }) { fields -> operate("model", fields) { modelDialog = false } }
+    editTarget?.let { target -> EditMessageDialog(key, target, view, repo, enabled, { editTarget = null }) { fields, clear -> operate("edit", fields) { clear(); editTarget = null } } }
     if (stopConfirm) AlertDialog(onDismissRequest = { stopConfirm = false }, title = { Text("中断 ${host?.host?.name} 上的任务？") }, text = { Text("只中断当前会话的这一轮，不影响其他电脑。") }, confirmButton = { TextButton(onClick = { stopConfirm = false; operate("interrupt") }) { Text("确认中断") } }, dismissButton = { TextButton(onClick = { stopConfirm = false }) { Text("继续运行") } })
 }
 

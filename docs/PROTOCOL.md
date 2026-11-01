@@ -10,11 +10,12 @@ HTTPS/WSS，默认端口 48761。只有 `/api/v1/pair` 不要求 Bearer 设备�
 | GET `/api/v1/projects` | 这台电脑已登记的本地项目及当前实例；排除 SSH／云项目 |
 | GET `/api/v1/threads/{threadId}` | 原会话历史、实时状态、输入请求和可显示执行结果 |
 | GET `/api/v1/threads/{threadId}/fork-context` | 本机原会话的已确认工作目录、轮次、Fork 及工作树可用性 |
+| GET `/api/v1/threads/{threadId}/models` | 原会话模型／强度和本机提供商的可验证配置目录，不包含账号密钥 |
 | WSS `/api/v1/events?instance=...&after=...` | 每台电脑一条复用事件流；支持有界续传及 reset |
 | POST `/api/v1/operations` | 有限类型的控制请求，不是任意 RPC 入口 |
 | GET `/api/v1/operations/{operationId}` | 查询已持久化操作结果，不重新执行 |
 
-操作包括 hostId、instanceId、threadId、operationId(UUID)、type；针对轮次的操作还包括 turnId。支持 send、steer、interrupt、decision、answer、activate、create、fork。activate 只打开目录中已存在的原桌面会话。create 为用户明确点击“创建并发送”的新建操作，threadId 必须为空，不得借它操作已有会话。
+操作包括 hostId、instanceId、threadId、operationId(UUID)、type；针对轮次的操作还包括 turnId。支持 send、steer、interrupt、decision、answer、activate、create、fork、model、edit。activate 只打开目录中已存在的原桌面会话。create 为用户明确点击“创建并发送”的新建操作，threadId 必须为空，不得借它操作已有会话。
 
 hostId 来自每台电脑本地持久化身份，不使用电脑名或 IP。instanceId 在桥接启动、IPC 断开或原桌面后端进程变化时更新。实际发出控制前再次检查桌面后端身份及目标轮次。审批还匹配真实未解决请求的 ID、类型和轮次；未知请求不转交手机执行。
 
@@ -49,3 +50,21 @@ Android 的操作锁在点击时同步设置；仓库层采用按 hostId 的 try
 fork 操作的 threadId 是原会话，另带 environment（same-directory/worktree）、latestTurnId 和空 turnId。桥接重新核对本机桌面目录、真实快照、实例及最新轮次；临时会话、运行中、有待处理请求、缺少工作目录或来源变化均拒绝。worktree 还要求原工作目录或其父级存在 Git 元数据。只向原桌面 fork_thread 传 threadId 与 environment.type；路径、分支、提示词、模型及权限覆盖不转发。
 
 Fork 同样在派发前持久化意图，派发后异常保留 uncertain。same-directory 只有 status=created 且 synchronization.status=complete、真实 threadId 格式有效时才自动打开。worktree 的 queued/clientThreadId 仅表示已提交，不能作为真实子会话路由。设置未完成时保留来源电脑隔离的结果提示，不自动发送指令或再次 Fork。用户可在电脑核对后清除提示；清除不是撤销或重试。
+
+## 0.1.4 模型、编辑及完成标识
+
+`model` 操作带 `catalogInstanceId`、`expectedModel`、`expectedEffort`、`expectedProvider`、`model`、`effort`。仅接受该电脑且提供商匹配的已配置目录项，提交前重新读取和校验。原生 `thread-follower-update-thread-settings` v2 只传 model、effort，附 ifModelEquals／ifEffortEquals 条件，省略 activeTurnId 使其用于下一轮；不转发任意设置、路径或权限。条件未满足时不应用，客户端提示重新选择。
+
+配置目录只在明确配置 `model_catalog_json`、提供商相符、未检测到项目级配置时使用；TOML 使用解析器而非正则，不对手机开放配置文件读取。解析失败只保留当前模型，不以其他 PC、猜测模型或凭据换取可选项。
+
+会话响应增加 `editTarget`（turnId、fingerprint、text、allowed、reason）。`edit` 操作携带 `editInstanceId`、`editTurnId`、`editFingerprint` 和修改后的 text，校验仍是最后一轮、无运行／待处理事项且原消息未变。当前只支持单条纯文字初始消息，原轮次必须明确使用桌面默认权限；含追加、附件或结构化上下文的消息留在电脑处理。调用原生 `thread-follower-edit-last-user-turn` v2，固定 allowEarlierMessages=false、shouldSendPermissionOverrides=false，不自行发原始 rollback 或直接修改记录。原生会先撤回再重生成；失败或断线可能只完成前半步，必须人工核对，不自动再次提交。
+
+会话响应增加 `latestTurnId`；agentMessage 增加 `phase`、`turnStatus`。只有 final_answer 且 turnStatus=completed 才标注完成。手机未读完成标记和首页筛选用 Keystore 加密保存，标记键含 hostId／threadId，读取还核对 turnId，不修改桌面的已读状态。
+
+## 0.1.4 运行时兼容性
+
+`status` 增加 `knownBuild`、`compatibilityMode=runtime-protocol` 和 `compatibilityNote`；原有 `compatible` 表示当前握手与任务目录契约通过，不表示该构建每个操作已实测。桌面版本与归档哈希仅作诊断，不作为全局控制白名单。桥接把最近成功自检的构建、哈希、时间保存在本机 `compatibility.dpapi`，升级或 IPC 重连时重新检查。
+
+建立连接前确认唯一原桌面 app-server、IPC 握手客户端身份、原生工具目录及 list_threads 输入契约；桌面工具每次调用核对实际公布的 schema。会话控制校验本机身份、完整历史结构、已知轮次状态和 requests；不支持的结构仅阻止该目标的控制，不写会话数据库或启动替代后端。
+
+原生 follower 请求仍使用明确的方法版本。只有路由明确返回 no-client-found、no-handler-for-request 或 request-version-mismatch 才认定未派发并记为 rejected；不会自动改低版本或重发。派发后其他错误、超时和断线仍为 uncertain，持久化锁和人工核对保留。不增加远程工具枚举、任意 RPC 或版本检查绕过接口。

@@ -29,6 +29,9 @@ class Repository(private val context: Context) {
     val histories = MutableStateFlow<Map<ThreadKey, JSONObject>>(emptyMap())
     val message = MutableStateFlow("")
     val monitoring = MutableStateFlow(false)
+    val homeSelection = MutableStateFlow(HomeSelection())
+    val unreadCompletions = MutableStateFlow<Map<ThreadKey, String>>(emptyMap())
+    private var readCompletions: Map<ThreadKey, String> = emptyMap()
     private val jobs = ConcurrentHashMap<String, Job>()
     private val apis = ConcurrentHashMap<String, HostApi>()
     private val selected = ConcurrentHashMap.newKeySet<ThreadKey>()
@@ -37,7 +40,12 @@ class Repository(private val context: Context) {
     private var visible = false
     var notify: ((Notice) -> Unit)? = null
     init {
-        try { states.value = store.hosts().associate { it.id to HostState(it) } }
+        try {
+            states.value = store.hosts().associate { it.id to HostState(it) }
+            homeSelection.value = HomeSelection.parse(store.get("home-selection", "{}")).let { if (it.hostId.isEmpty() || states.value[it.hostId]?.host?.followed == true) it else it.copy(hostId = "") }
+            unreadCompletions.value = completionMarkers(store.get("unread-completions", "[]")).filterKeys { states.value.containsKey(it.hostId) }
+            readCompletions = completionMarkers(store.get("read-completions", "[]")).filterKeys { states.value.containsKey(it.hostId) }
+        }
         catch (_: Exception) { message.value = "手机安全存储无法解密。为保护信任关系，请清除应用数据后重新配对。" }
     }
     fun foreground(value: Boolean) { visible = value; reconcile() }
@@ -49,8 +57,16 @@ class Repository(private val context: Context) {
     }
     private fun save() = store.save(states.value.values.map { it.host })
     @Synchronized fun rename(id: String, value: String) { if (value.isBlank() || value.length > 60) return; states.update { old -> old + (id to old.getValue(id).copy(host = old.getValue(id).host.copy(name = value.trim()))) }; save() }
-    @Synchronized fun follow(id: String, value: Boolean) { states.update { old -> old + (id to old.getValue(id).copy(host = old.getValue(id).host.copy(followed = value))) }; save(); reconcile() }
-    @Synchronized fun remove(id: String) { jobs.remove(id)?.cancel(); apis.remove(id)?.close(); states.update { it - id }; histories.update { all -> all.filterKeys { it.hostId != id } }; selected.removeAll { it.hostId == id }; store.put("pending-$id", "{}"); save() }
+    @Synchronized fun selectHome(value: HomeSelection) { require(value.hostId.isEmpty() || states.value[value.hostId]?.host?.followed == true); store.put("home-selection", value.json()); homeSelection.value = value }
+    @Synchronized fun follow(id: String, value: Boolean) { states.update { old -> old + (id to old.getValue(id).copy(host = old.getValue(id).host.copy(followed = value))) }; if (!value) selectHome(homeSelection.value.without(id)); save(); reconcile() }
+    @Synchronized fun remove(id: String) { jobs.remove(id)?.cancel(); apis.remove(id)?.close(); states.update { it - id }; histories.update { all -> all.filterKeys { it.hostId != id } }; selected.removeAll { it.hostId == id }; signals.keys.removeAll { it.hostId == id }; selectHome(homeSelection.value.without(id)); unreadCompletions.update { all -> all.filterKeys { it.hostId != id } }; readCompletions = readCompletions.filterKeys { it.hostId != id }; store.put("read-completions", completionMarkersJson(readCompletions)); saveUnread(); store.put("pending-$id", "{}"); save() }
+    @Synchronized private fun saveUnread() = store.put("unread-completions", completionMarkersJson(unreadCompletions.value))
+    @Synchronized fun markRead(key: ThreadKey, turnId: String) {
+        if (turnId.isEmpty() || !states.value.containsKey(key.hostId)) return
+        if (readCompletions[key] != turnId) { readCompletions = readCompletions + (key to turnId); store.put("read-completions", completionMarkersJson(readCompletions)) }
+        if (unreadCompletions.value[key] == turnId) { unreadCompletions.update { it - key }; saveUnread() }
+    }
+    @Synchronized private fun completed(key: ThreadKey, turnId: String) { if (states.value.containsKey(key.hostId) && isUnreadCompletion(key, turnId, readCompletions)) { unreadCompletions.update { it + (key to turnId) }; saveUnread() } }
     suspend fun pair(text: String): String = withContext(Dispatchers.IO) {
         val code = PairCode.parse(text)
         val previous = states.value[code.host.id]
@@ -101,6 +117,7 @@ class Repository(private val context: Context) {
                                         "threadUpdated" -> {
                                             val data = event.getJSONObject("data"); val key = ThreadKey(id, data.getString("threadId")); val taskStatus = data.optString("status")
                                             val previous = signals.put(key, data)
+                                            if (taskStatus == "completed" && (previous?.optString("status") != "completed" || previous.optString("turnId") != data.optString("turnId"))) completed(key, data.optString("turnId"))
                                             states.update { all -> all[id]?.let { h -> all + (id to h.copy(threads = h.threads.map { t -> if (t.optString("id") == key.threadId) JSONObject(t.toString()).put("status", taskStatus).put("pendingCount", data.optInt("pendingCount")) else t })) } ?: all }
                                             if (monitoring.value && shouldNotify(previous?.optString("status"), taskStatus, previous?.optString("requestIds").orEmpty(), data.optString("requestIds"))) notify?.invoke(Notice(id, key.threadId, host.name, when(taskStatus) { "needsInput" -> "任务需要你处理"; "failed" -> "任务执行失败"; "interrupted" -> "任务已中断"; else -> "任务已完成" }))
                                             if (key in selected) scope.launch { load(key) }
@@ -145,9 +162,11 @@ class Repository(private val context: Context) {
     suspend fun operate(key: ThreadKey, type: String, fields: JSONObject = JSONObject()): String = withContext(Dispatchers.IO) {
       operationGate.run(key.hostId) {
         val host = states.value[key.hostId] ?: error("电脑已移除")
-        require(host.online && host.compatible) { "电脑离线或版本未经验证；只保存草稿，不排队执行" }
+        require(host.online && host.compatible) { "电脑离线或原生协议尚未就绪；只保存草稿，不排队执行" }
         val history = histories.value[key] ?: error("请先刷新会话状态")
         require(history.optString("instanceId") == host.instance) { "实例已经改变，请刷新" }
+        if (type == "model") require(fields.optString("catalogInstanceId") == host.instance) { "模型目录所属实例已变化，请重新选择" }
+        if (type == "edit") require(fields.optString("editInstanceId") == host.instance) { "编辑所属实例已变化，请重新打开编辑" }
         val body = JSONObject(fields.toString()).put("hostId", key.hostId).put("instanceId", host.instance).put("threadId", key.threadId).put("turnId", history.optString("activeTurnId")).put("operationId", UUID.randomUUID().toString()).put("type", type)
         val api = apis[key.hostId] ?: error("电脑未连接")
         val pendingName = "pending-${key.hostId}"; val old = JSONObject(store.get(pendingName, "{}"))
@@ -159,16 +178,24 @@ class Repository(private val context: Context) {
             store.put(pendingName, "{}")
             load(key)
             if (result.optString("status") == "rejected") error(result.optJSONObject("result")?.optString("error") ?: "电脑未接受指令")
+            if (type == "model" && result.optJSONObject("result")?.optBoolean("applied") != true) error("电脑模型设置已变化，请刷新后重新选择")
             "电脑已接收"
         } catch (e: Exception) {
-            message.value = "发送结果未确认，请核对会话。不会自动重发。"
+            if (store.get(pendingName, "{}") != "{}") message.value = "发送结果未确认，请核对会话。不会自动重发。"
             throw e
         }
       }
     }
+    suspend fun models(key: ThreadKey): JSONObject = withContext(Dispatchers.IO) {
+        val host = states.value[key.hostId] ?: error("电脑已移除")
+        require(host.online && host.compatible) { "电脑离线，不能读取模型" }
+        val result = (apis[key.hostId] ?: error("电脑未连接")).request("/api/v1/threads/${key.threadId}/models")
+        require(result.optString("hostId") == key.hostId && result.optString("threadId") == key.threadId && result.optString("instanceId") == host.instance && states.value[key.hostId]?.instance == host.instance) { "电脑实例已变化，请重新选择模型" }
+        result
+    }
     suspend fun projects(id: String): ProjectCatalog = withContext(Dispatchers.IO) {
         val host = states.value[id] ?: error("电脑已移除")
-        require(host.online && host.compatible) { "电脑离线或版本未经验证，不能读取创建位置" }
+        require(host.online && host.compatible) { "电脑离线或原生协议尚未就绪，不能读取创建位置" }
         val response = (apis[id] ?: error("电脑未连接")).request("/api/v1/projects")
         require(response.optString("hostId") == id && response.optString("instanceId") == states.value[id]?.instance) { "电脑实例已变化，请刷新位置" }
         ProjectCatalog(id, response.getString("instanceId"), response.optJSONArray("projects")?.objects().orEmpty())
@@ -202,7 +229,7 @@ class Repository(private val context: Context) {
     fun creationDraft(id: String, draft: JSONObject) = store.put("create-draft-$id", draft.toString())
     suspend fun forkContext(key: ThreadKey): JSONObject = withContext(Dispatchers.IO) {
         val host = states.value[key.hostId] ?: error("电脑已移除")
-        require(host.online && host.compatible) { "电脑离线或版本未经验证，不能 Fork" }
+        require(host.online && host.compatible) { "电脑离线或原生协议尚未就绪，不能 Fork" }
         val result = (apis[key.hostId] ?: error("电脑未连接")).request("/api/v1/threads/${key.threadId}/fork-context")
         require(result.optString("hostId") == key.hostId && result.optString("instanceId") == states.value[key.hostId]?.instance && result.optString("threadId") == key.threadId) { "电脑或实例已变化，请重新读取来源" }
         result
@@ -210,7 +237,7 @@ class Repository(private val context: Context) {
     suspend fun fork(key: ThreadKey, context: JSONObject, environment: String): JSONObject = withContext(Dispatchers.IO) {
         operationGate.run(key.hostId) {
             val host = states.value[key.hostId] ?: error("电脑已移除")
-            require(host.online && host.compatible) { "电脑离线或版本未经验证，不会排队或转到其他电脑" }
+            require(host.online && host.compatible) { "电脑离线或原生协议尚未就绪，不会排队或转到其他电脑" }
             val body = forkOperation(key, host.instance, context, environment)
             val pendingName = "pending-${key.hostId}"
             require(JSONObject(store.get(pendingName, "{}")).length() == 0) { "上次操作尚未确认，请先核对，不会重复 Fork" }

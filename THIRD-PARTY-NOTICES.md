@@ -4,6 +4,7 @@ This project uses the following components. Their respective upstream licenses a
 
 - .NET / ASP.NET Core / Windows Forms / System.Management: Microsoft and .NET contributors, MIT license. https://github.com/dotnet
 - QRCoder 1.6.0: Raffael Herrmann and contributors, MIT license. https://github.com/codebude/QRCoder
+- Tomlyn 0.19.0: Alexandre Mutel and contributors, BSD 2-Clause license. https://github.com/xoofx/Tomlyn
 - Kotlin and kotlinx.coroutines: JetBrains and contributors, Apache License 2.0. https://github.com/JetBrains/kotlin
 - AndroidX, Jetpack Compose, Material Components: Android Open Source Project, Apache License 2.0. https://android.googlesource.com/platform/frameworks/support/
 - OkHttp 4.12.0 and Okio: Square and contributors, Apache License 2.0. https://github.com/square/okhttp

@@ -44,7 +44,12 @@ sealed class PipePeer : IAsyncDisposable
         {
             await Write(rpc ? J.Node(new { jsonrpc = "2.0", id, method, @params = parameters }) : J.Node(new { type = "request", requestId = id, sourceClientId = ClientId, method, @params = parameters, version, targetClientId = target, timeoutMs = 15000 }));
             var result = await completion.Task.WaitAsync(TimeSpan.FromSeconds(25), stopped.Token);
-            if (result.S("resultType") == "error" || result["error"] != null) throw new ApiError(409, "Codex 未接受请求：" + (result["error"]?.ToJsonString() ?? "unknown"));
+            if (result.S("resultType") == "error" || result["error"] != null)
+            {
+                var error = result["error"]?.ToString() ?? "unknown";
+                var beforeDispatch = Compatibility.RouterRejectedBeforeDispatch(error);
+                throw new ApiError(409, beforeDispatch ? "此操作的桌面协议暂不兼容或会话尚未就绪，未发送指令；其他功能仍可使用。" : "Codex 未接受请求：" + error, beforeDispatch);
+            }
             return result;
         }
         finally { pending.TryRemove(id, out _); }
@@ -156,6 +161,7 @@ static class StateView
                 if (text.Length == 0 && type != "fileChange") continue;
                 bool truncated = text.Length > 20000;
                 var message = J.Node(new { id = item.S("id"), turnId = turn.S("turnId"), kind = type, text = Bounded(text), truncated, status = item.S("status") });
+                if (type == "agentMessage") { message["phase"] = item.S("phase"); message["turnStatus"] = turn.S("status"); }
                 if (type == "commandExecution")
                 {
                     message["command"] = Bounded(item.S("command"));
@@ -173,7 +179,7 @@ static class StateView
         }
         // Preserve one legacy reasoning row for old clients; new clients use the rolling status field.
         if (latestReasoning != null) all.Insert(reasoningPosition, latestReasoning.Copy());
-        return J.Node(new { threadId = state.S("id"), instanceId = instance, title = state.S("title"), activeTurnId = ActiveTurn(state), latestReasoning, requests = state.Array("requests"), messages = all.TakeLast(600), hasOlder = all.Count > 600, status = state.Array("requests").Count > 0 ? "needsInput" : ActiveTurn(state).Length > 0 ? "active" : "idle", model = state.S("latestModel") });
+        return J.Node(new { threadId = state.S("id"), instanceId = instance, title = state.S("title"), activeTurnId = ActiveTurn(state), latestTurnId = turns.LastOrDefault().S("turnId"), latestReasoning, editTarget = ThreadSettings.EditTarget(state), requests = state.Array("requests"), messages = all.TakeLast(600), hasOlder = all.Count > 600, status = state.Array("requests").Count > 0 ? "needsInput" : ActiveTurn(state).Length > 0 ? "active" : turns.LastOrDefault().S("status", "idle"), model = ThreadSettings.Model(state), effort = state.S("latestReasoningEffort") });
     }
     public static void Apply(JsonNode state, JsonArray patches)
     {
@@ -193,7 +199,7 @@ static class StateView
     }
 }
 
-sealed class Desktop(EventHub events) : IAsyncDisposable
+sealed class Desktop(EventHub events, Vault? vault = null) : IAsyncDisposable
 {
     readonly object sync = new();
     PipePeer? ipc;
@@ -204,7 +210,11 @@ sealed class Desktop(EventHub events) : IAsyncDisposable
     JsonArray catalog = [];
     string caller = "";
     string backend = "";
+    Dictionary<string, JsonNode> toolSchemas = [];
     public string Version { get; private set; } = "";
+    public string ArchiveHash { get; private set; } = "";
+    public bool KnownBuild { get; private set; }
+    public string CompatibilityNote => !Compatible ? "原生协议尚未就绪；不按桌面版本号锁定" : KnownBuild ? "已知构建，原生协议自检通过" : "协议自检通过；此桌面构建尚未完整回归，不会仅因版本号不同锁定";
     public bool Compatible { get; private set; }
     public bool Connected => ipc?.Connected == true;
     public string LastError { get; private set; } = "尚未连接 Codex";
@@ -215,18 +225,30 @@ sealed class Desktop(EventHub events) : IAsyncDisposable
         try
         {
             if (Connected) return;
-            await CheckBuild();
+            Compatible = false;
+            await ReadBuildInfo();
+            var originalBackend = BackendIdentity();
+            if (originalBackend.Length == 0) throw new ApiError(503, "请只运行一个 Codex 桌面后端；不会连接替代后端");
             var peer = new PipePeer("codex-ipc");
             peer.Received += OnMessage;
-            peer.Closed += () => { lock (sync) states.Clear(); owners.Clear(); events.Reset(); };
-            await peer.Connect(true); ipc = peer; LastError = "";
+            peer.Closed += () => { Compatible = false; lock (sync) states.Clear(); owners.Clear(); events.Reset(); };
+            try
+            {
+                await peer.Connect(true);
+                var schemas = await ReadToolSchemas();
+                if (!schemas.TryGetValue("list_threads", out var list) || !Compatibility.HandshakeReady(peer.ClientId, list)) throw new ApiError(503, "原桌面暂未提供兼容的握手或任务目录协议");
+                if (BackendIdentity() != originalBackend) throw new ApiError(503, "桌面后端正在切换，请稍后连接");
+                backend = originalBackend; toolSchemas = schemas; ipc = peer; Compatible = true; LastError = "";
+                vault?.Write("compatibility", new { version = Version, archiveHash = ArchiveHash, knownBuild = KnownBuild, checkedAt = DateTimeOffset.UtcNow, mode = "runtime-protocol", routerHandshake = true, nativeToolSchemas = true });
+            }
+            catch { Compatible = false; await peer.DisposeAsync(); throw; }
         }
         finally { connectionLock.Release(); }
     }
-    async Task CheckBuild()
+    async Task ReadBuildInfo()
     {
-        Compatible = false;
-        foreach (var process in Process.GetProcessesByName("ChatGPT"))
+        KnownBuild = false; Version = "未识别的 Codex 桌面构建"; ArchiveHash = "";
+        foreach (var process in Process.GetProcessesByName("ChatGPT").Concat(Process.GetProcessesByName("Codex")))
         {
             try
             {
@@ -235,7 +257,8 @@ sealed class Desktop(EventHub events) : IAsyncDisposable
                 if (!File.Exists(archive)) continue;
                 Version = Directory.GetParent(Path.GetDirectoryName(exe)!)!.Name;
                 using var file = File.OpenRead(archive);
-                Compatible = Convert.ToHexString(await SHA256.HashDataAsync(file)) == "BBEC1D64E135B718A154B31655BB8AD9A39472BAC1B2CABBA991A9D97A339DD8";
+                ArchiveHash = Convert.ToHexString(await SHA256.HashDataAsync(file));
+                KnownBuild = ArchiveHash == "BBEC1D64E135B718A154B31655BB8AD9A39472BAC1B2CABBA991A9D97A339DD8";
                 return;
             }
             catch { }
@@ -266,14 +289,25 @@ sealed class Desktop(EventHub events) : IAsyncDisposable
             try { var id = JsonNode.Parse(line).S("id"); if (Guid.TryParse(id, out _)) return id; } catch { }
         throw new ApiError(503, "找不到现有 Codex 会话");
     }
+    static string ToolPipe()
+    {
+        var pipes = Directory.GetFiles(@"\\.\pipe\", "codex-app-tools-*");
+        if (pipes.Length != 1) throw new ApiError(503, "未找到唯一的 Codex 桌面工具服务，请只运行一个桌面实例");
+        return Path.GetFileName(pipes[0]);
+    }
+    static async Task<Dictionary<string, JsonNode>> ReadToolSchemas()
+    {
+        await using var peer = new PipePeer(ToolPipe()); await peer.Connect(false);
+        var response = await peer.Request("tools/list", new { threadStartKind = "all" }, rpc: true);
+        return response["result"].Array("tools").OfType<JsonObject>().Where(t => t.S("namespace") == "codex_app" && t["inputSchema"] is JsonObject).GroupBy(t => t.S("name")).ToDictionary(g => g.Key, g => g.First()["inputSchema"]!.Copy());
+    }
     async Task<JsonNode> AppTool(string tool, object arguments, string? target = null)
     {
         // Only these read/control tools are reachable; raw desktop RPC is never exposed by HTTP.
         if (tool is not ("list_threads" or "read_thread" or "navigate_to_codex_page" or "list_projects" or "create_thread" or "fork_thread")) throw new ApiError(400, "工具不允许");
-        var pipes = Directory.GetFiles(@"\\.\pipe\", "codex-app-tools-*");
-        if (pipes.Length != 1) throw new ApiError(503, "未找到唯一的 Codex 桌面工具服务，请只运行一个桌面实例");
+        if (!toolSchemas.TryGetValue(tool, out var schema) || !Compatibility.Matches(schema, J.Node(arguments))) throw new ApiError(409, "这项功能的原生参数协议暂不兼容，未提交；其他功能仍可使用", true);
         if (caller.Length == 0) caller = CallerId();
-        await using var peer = new PipePeer(Path.GetFileName(pipes[0])); await peer.Connect(false);
+        await using var peer = new PipePeer(ToolPipe()); await peer.Connect(false);
         var response = await peer.Request("tools/call", new { arguments, callerSource = "codex", callId = Guid.NewGuid().ToString(), hostId = "local", @namespace = "codex_app", threadId = target ?? caller, tool, turnId = "remote-" + Guid.NewGuid() }, rpc: true);
         var result = response["result"]!;
         if (result["success"]?.GetValue<bool>() != true) throw new ApiError(409, "桌面工具拒绝了请求：" + string.Join("\n", result.Array("contentItems").Select(n => n.S("text"))));
@@ -328,7 +362,7 @@ sealed class Desktop(EventHub events) : IAsyncDisposable
     }
     public async Task<JsonNode> Control(JsonNode body)
     {
-        if (!Compatible) throw new ApiError(409, "Codex 版本尚未验证，控制已锁定；不会使用其他后端代替");
+        if (!Compatible) throw new ApiError(409, "原桌面协议自检尚未就绪，请稍后刷新；不会使用其他后端代替");
         if (backend.Length == 0 || BackendIdentity() != backend || body.S("instanceId") != events.InstanceId) throw new ApiError(409, "Codex 后端已改变，请重新读取状态");
         var id = body.S("threadId"); var type = body.S("type");
         if (type == "fork")
@@ -338,7 +372,7 @@ sealed class Desktop(EventHub events) : IAsyncDisposable
             if (BackendIdentity() != backend || body.S("instanceId") != events.InstanceId) throw new ApiError(409, "实例已变化，请重新确认 Fork 来源");
             JsonNode forked;
             try { forked = await AppTool("fork_thread", arguments, id); }
-            catch (ApiError e) { throw new IOException("Fork outcome requires reconciliation", e); }
+            catch (ApiError e) when (!e.BeforeDispatch) { throw new IOException("Fork outcome requires reconciliation", e); }
             events.Publish("catalogInvalidated", new { });
             return forked;
         }
@@ -349,7 +383,7 @@ sealed class Desktop(EventHub events) : IAsyncDisposable
             if (BackendIdentity() != backend || body.S("instanceId") != events.InstanceId) throw new ApiError(409, "实例已变化，请重新确认创建位置");
             JsonNode created;
             try { created = await AppTool("create_thread", arguments); }
-            catch (ApiError e) { throw new IOException("Creation outcome requires reconciliation", e); }
+            catch (ApiError e) when (!e.BeforeDispatch) { throw new IOException("Creation outcome requires reconciliation", e); }
             // A created thread may still report a failed first turn. Never submit that prompt again.
             if (created.S("threadId").Length == 0 && Guid.TryParse(created.S("conversationId"), out _)) created["threadId"] = created.S("conversationId");
             events.Publish("catalogInvalidated", new { });
@@ -363,10 +397,27 @@ sealed class Desktop(EventHub events) : IAsyncDisposable
             throw new IOException("Desktop opened but the live owner is not confirmed");
         }
         var state = await Snapshot(id, true); var active = StateView.ActiveTurn(state); var expected = body.S("turnId");
+        Compatibility.ValidateState(state, id);
         if (expected != active) throw new ApiError(409, "目标轮次已经变化，请刷新后重新确认");
         var owner = owners[id]; var parameters = new JsonObject { ["conversationId"] = id };
         string method; int version = 1;
-        if (type is "send" or "steer")
+        if (type == "edit")
+        {
+            if (body.S("editInstanceId") != events.InstanceId) throw new ApiError(409, "编辑所属实例已变化，请重新打开编辑");
+            parameters = ThreadSettings.EditArguments(state, body);
+            method = "thread-follower-edit-last-user-turn"; version = 2;
+        }
+        else if (type == "model")
+        {
+            if (body.S("catalogInstanceId") != events.InstanceId) throw new ApiError(409, "模型目录所属实例已变化，请重新选择");
+            var models = await Models(id);
+            state = await Snapshot(id, true);
+            Compatibility.ValidateState(state, id);
+            if (StateView.ActiveTurn(state) != expected) throw new ApiError(409, "目标轮次已变化，请重新选择模型");
+            parameters = ThreadSettings.ModelArguments(state, body, models.Array("models"));
+            method = "thread-follower-update-thread-settings"; version = 2;
+        }
+        else if (type is "send" or "steer")
         {
             var text = body.S("text").Trim();
             if (text.Length is < 1 or > 32000) throw new ApiError(400, "指令必须为 1 至 32000 字符");
@@ -421,8 +472,23 @@ sealed class Desktop(EventHub events) : IAsyncDisposable
         }
         else throw new ApiError(400, "不支持的操作");
         if (BackendIdentity() != backend || body.S("instanceId") != events.InstanceId) throw new ApiError(409, "Codex 后端已改变，旧操作未发送");
-        try { return (await ipc!.Request(method, parameters, version, owner))["result"]!.Copy(); }
-        catch (ApiError e) { throw new IOException("Desktop dispatch outcome requires reconciliation", e); }
+        try
+        {
+            var result = (await ipc!.Request(method, parameters, version, owner))["result"]!.Copy();
+            if (type == "model" && result["applied"]?.GetValue<bool>() != true) return J.Node(new { applied = false, warning = "电脑模型设置已变化，请刷新后重新选择" });
+            return result;
+        }
+        catch (ApiError e) when (!e.BeforeDispatch) { throw new IOException("Desktop dispatch outcome requires reconciliation", e); }
+    }
+    public async Task<JsonNode> Models(string id)
+    {
+        await Snapshot(id, true);
+        await ipc!.Request("thread-follower-read-model-settings", new { conversationId = id }, 1, owners[id]);
+        var state = await Snapshot(id, true);
+        JsonNode? configured = null; bool matches = false;
+        try { (configured, matches) = ThreadSettings.ReadCatalog(state); } catch { }
+        var choices = ThreadSettings.Catalog(state, configured, matches);
+        return J.Node(new { instanceId = events.InstanceId, threadId = id, model = ThreadSettings.Model(state), effort = state.S("latestReasoningEffort"), provider = state.S("modelProvider"), models = choices, warning = matches ? "仅修改此会话下一轮的模型与思考强度，不中断当前任务、不修改全局配置或权限。" : "此电脑未提供可验证的模型目录，暂时只显示当前模型；请在电脑切换其他模型。" });
     }
     public async Task<JsonArray> Projects()
     {
@@ -433,6 +499,7 @@ sealed class Desktop(EventHub events) : IAsyncDisposable
     {
         if (!(await Catalog()).OfType<JsonNode>().Any(t => t.S("id") == id)) throw new ApiError(404, "Fork 来源不在这台电脑的本地 Codex 会话列表中");
         var state = await Snapshot(id, true);
+        Compatibility.ValidateState(state, id);
         return Forking.Context(state, events.InstanceId, Forking.GitRoot(state.S("cwd")));
     }
     string BackendIdentity()
@@ -444,7 +511,10 @@ sealed class Desktop(EventHub events) : IAsyncDisposable
             var command = process["CommandLine"]?.ToString() ?? "";
             // Desktop currently uses the default stdio transport without a literal "stdio" argument.
             if (!command.Contains("app-server")) continue;
-            try { if (Process.GetProcessById(Convert.ToInt32(process["ParentProcessId"])).ProcessName != "ChatGPT") continue; } catch { continue; }
+            try {
+                using var parent = Process.GetProcessById(Convert.ToInt32(process["ParentProcessId"]));
+                if (parent.ProcessName is not ("ChatGPT" or "Codex") || !File.Exists(Path.Combine(Path.GetDirectoryName(parent.MainModule!.FileName)!, "resources", "app.asar"))) continue;
+            } catch { continue; }
             ids.Add(process["ProcessId"] + ":" + process["CreationDate"]);
         }
         return ids.Count == 1 ? ids[0] : "";

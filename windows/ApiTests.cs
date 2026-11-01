@@ -61,6 +61,15 @@ static class ApiTests
             });
             await Test("Fork requires a real source thread identity", async () => { using var response = await Post(a, "/api/v1/operations", J.Node(new { hostId = ia.HostId, instanceId = ea.InstanceId, threadId = "", operationId = Guid.NewGuid(), type = "fork", environment = "same-directory" })); Check(response.StatusCode == HttpStatusCode.BadRequest); });
             await Test("Fork context cannot be read without pairing", async () => { using var stranger = Client(ia, 48762); using var response = await stranger.GetAsync("/api/v1/threads/11111111-1111-4111-8111-111111111111/fork-context"); Check(response.StatusCode == HttpStatusCode.Unauthorized); });
+            await Test("Model catalog requires pairing", async () => { using var stranger = Client(ia, 48762); using var response = await stranger.GetAsync("/api/v1/threads/11111111-1111-4111-8111-111111111111/models"); Check(response.StatusCode == HttpStatusCode.Unauthorized); });
+            await Test("Model and edit cannot cross hosts or reuse stale instances", async () => {
+                foreach (var type in new[] { "model", "edit" }) {
+                    using var foreign = await Post(b, "/api/v1/operations", J.Node(new { hostId = ia.HostId, instanceId = eb.InstanceId, threadId = Guid.NewGuid(), operationId = Guid.NewGuid(), type }));
+                    using var stale = await Post(a, "/api/v1/operations", J.Node(new { hostId = ia.HostId, instanceId = "stale", threadId = Guid.NewGuid(), operationId = Guid.NewGuid(), type }));
+                    Check(foreign.StatusCode == HttpStatusCode.Conflict && stale.StatusCode == HttpStatusCode.Conflict);
+                }
+            });
+            await Test("No arbitrary model RPC endpoint is exposed", async () => { using var response = await Post(a, "/api/v1/rpc", J.Node(new { method = "model/list" })); Check(response.StatusCode == HttpStatusCode.NotFound); });
             await Test("WSS subscription multiplexes host events", async () =>
             {
                 using var socket = new ClientWebSocket(); socket.Options.Proxy = null;

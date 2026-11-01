@@ -22,8 +22,17 @@ security certification.
   connection. Credentials are not a substitute for protecting a compromised PC.
 - Native desktop permissions, tools and sandbox settings remain in effect. The
   mobile bridge does not make an otherwise unsafe Codex instruction safe.
-- The native IPC adapter is version-specific. An unknown desktop version or
-  archive hash must fail closed, not silently bypass the compatibility check.
+- The native IPC adapter is an unstable, version-dependent interface. Since
+  0.1.4, version strings and archive hashes are diagnostic, not an allowlist.
+  A runtime handshake, the advertised native tool argument schemas, and live
+  conversation identity/state are checked instead. Unsupported operations are
+  rejected individually; incompatible handshake or backend identity still
+  prevents connection. No alternate backend or automatic protocol downgrade is
+  used. Passing these checks is not a full compatibility or security certification.
+- A native router's explicit pre-dispatch version/handler rejection is recorded
+  as rejected. Timeouts, disconnects and ambiguous native errors remain uncertain
+  and must not trigger automatic resubmission. Permissions, approvals, certificate
+  pinning, pairing and host/instance/turn checks are not relaxed by this policy.
 
 ## Lost phone or suspected disclosure
 

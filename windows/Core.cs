@@ -20,7 +20,7 @@ static class J
     public static bool Equal(string a, string b) => CryptographicOperations.FixedTimeEquals(Encoding.UTF8.GetBytes(a), Encoding.UTF8.GetBytes(b));
 }
 
-sealed class ApiError(int status, string message) : Exception(message) { public int Status { get; } = status; }
+sealed class ApiError(int status, string message, bool beforeDispatch = false) : Exception(message) { public int Status { get; } = status; public bool BeforeDispatch { get; } = beforeDispatch; }
 
 sealed class Vault
 {
