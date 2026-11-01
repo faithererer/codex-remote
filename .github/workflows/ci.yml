@@ -1,0 +1,58 @@
+name: Build and Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  source-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: node tools/audit-source.mjs
+
+  android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: microsoft
+          java-version: '17'
+      - uses: android-actions/setup-android@v3
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.13'
+      - run: sdkmanager "platforms;android-35" "build-tools;35.0.0"
+      - run: gradle -p android assembleDebug testDebugUnitTest lintDebug --no-daemon --console=plain
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - run: dotnet publish windows/CodexRemote.csproj -c Release -r win-x64 --self-contained true -o dist/windows --nologo
+      - name: Run isolated self-tests
+        shell: pwsh
+        run: |
+          $output = Join-Path $env:RUNNER_TEMP 'codex-remote-self-tests.json'
+          $process = Start-Process -FilePath (Resolve-Path 'dist/windows/CodexRemote.exe') -ArgumentList @('--self-test', ('"' + $output + '"')) -WindowStyle Hidden -Wait -PassThru
+          if ($process.ExitCode -ne 0 -or !(Test-Path -LiteralPath $output)) { throw 'Self-test process failed' }
+          $tests = Get-Content -LiteralPath $output -Raw | ConvertFrom-Json
+          $failed = @($tests.results | Where-Object { !$_.passed })
+          if ($failed.Count -gt 0) { $failed | Format-List; throw 'Self-tests failed' }
+          Write-Output "$($tests.results.Count) self-tests passed; no live desktop commands sent."
