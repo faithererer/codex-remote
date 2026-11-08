@@ -14,6 +14,23 @@ static class SelfTests
         Test("Host identity survives restart", () => { Check(Identity.Load(vault).HostId == Identity.Load(vault).HostId); });
         Test("DPAPI roundtrip and no plaintext", () => { vault.Write("test", new { secret = "test-value-do-not-export" }); Check(vault.Read<JsonNode>("test").S("secret") == "test-value-do-not-export"); Check(!System.Text.Encoding.UTF8.GetString(File.ReadAllBytes(Path.Combine(root, "test.dpapi"))).Contains("test-value")); });
         Test("Only Tailscale CGNAT range", () => { Check(Program.Tailnet(IPAddress.Parse("100.64.0.1"))); Check(Program.Tailnet(IPAddress.Parse("100.127.255.254"))); foreach (var ip in new[] { "100.63.255.255", "100.128.0.1", "192.168.1.1", "127.0.0.1", "8.8.8.8", "::1" }) Check(!Program.Tailnet(IPAddress.Parse(ip))); });
+        Test("LAN accepts RFC1918 boundaries and excludes public link-local multicast and loopback", () => {
+            foreach (var ip in new[] { "10.0.0.1", "10.255.255.254", "172.16.0.1", "172.31.255.254", "192.168.0.1", "192.168.255.254" }) Check(PrivateNetwork.IsLan(IPAddress.Parse(ip)));
+            foreach (var ip in new[] { "9.255.255.255", "11.0.0.0", "172.15.255.255", "172.32.0.0", "192.167.255.255", "192.169.0.0", "127.0.0.1", "169.254.1.1", "0.0.0.0", "224.0.0.1", "255.255.255.255", "100.64.1.1", "8.8.8.8", "fd00::1" }) Check(!PrivateNetwork.IsLan(IPAddress.Parse(ip)));
+        });
+        Test("Source policy follows the concrete listener without trusting forwarding headers", () => {
+            Check(PrivateNetwork.Allows(IPAddress.Parse("192.168.1.8"), IPAddress.Parse("192.168.1.9")));
+            Check(PrivateNetwork.Allows(IPAddress.Parse("100.64.0.8"), IPAddress.Parse("100.127.1.9")));
+            Check(!PrivateNetwork.Allows(IPAddress.Parse("8.8.8.8"), IPAddress.Parse("192.168.1.9")));
+            Check(!PrivateNetwork.Allows(IPAddress.Parse("100.64.0.8"), IPAddress.Parse("192.168.1.9")));
+            Check(!PrivateNetwork.Allows(IPAddress.Parse("192.168.1.8"), IPAddress.Parse("100.64.0.9")));
+            Check(!PrivateNetwork.Allows(IPAddress.Loopback, IPAddress.Loopback)); Check(!PrivateNetwork.Allows(null, IPAddress.Any));
+        });
+        Test("Listeners reject wildcard public loopback and mapped bind addresses", () => {
+            Check(PrivateNetwork.IsListener(IPAddress.Parse("192.168.1.8"))); Check(PrivateNetwork.IsListener(IPAddress.Parse("100.64.1.8")));
+            foreach (var ip in new[] { "0.0.0.0", "::", "127.0.0.1", "8.8.8.8", "::ffff:192.168.1.8" }) Check(!PrivateNetwork.IsListener(IPAddress.Parse(ip)));
+            Check(PrivateNetwork.Allows(IPAddress.Parse("::ffff:192.168.1.8"), IPAddress.Parse("192.168.1.9")));
+        });
         Test("Snapshot and native Immer patches", () => { var state = JsonNode.Parse("{\"a\":[1,2],\"b\":{\"c\":1}}")!; StateView.Apply(state, JsonNode.Parse("[{\"op\":\"add\",\"path\":[\"a\",1],\"value\":3},{\"op\":\"replace\",\"path\":[\"b\",\"c\"],\"value\":4},{\"op\":\"remove\",\"path\":[\"a\",0]}]")!.AsArray()); Check(state["a"]!.ToJsonString() == "[3,2]" && state["b"]!["c"]!.GetValue<int>() == 4); });
         Test("Operation dedupe survives restart", () => { var count = 0; var body = J.Node(new { operationId = Guid.NewGuid().ToString(), hostId = "host-A", threadId = "same" }); Func<Task<JsonNode>> action = () => { count++; return Task.FromResult(J.Node(new { ok = true })); }; new Operations(vault).Run(body, action).GetAwaiter().GetResult(); var result = new Operations(vault).Run(body, action).GetAwaiter().GetResult(); Check(count == 1 && result.S("status") == "accepted"); });
         Test("Same operation id different host rejected", () => { var op = new Operations(vault); var body = J.Node(new { operationId = Guid.NewGuid().ToString(), hostId = "host-A", threadId = "same" }); op.Run(body, () => Task.FromResult(J.Node(new { ok = true }))).GetAwaiter().GetResult(); body["hostId"] = "host-B"; try { op.Run(body, () => throw new Exception()).GetAwaiter().GetResult(); throw new Exception("Expected conflict"); } catch (ApiError e) { Check(e.Status == 409); } });

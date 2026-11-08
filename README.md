@@ -1,8 +1,8 @@
-# Codex 随行 0.1.4
+# Codex 随行 0.1.5
 
 中文 Android 多电脑 Codex 桌面控制台。Android 10 及以上；每台 Windows x64 电脑运行一个桥接程序，对接这台电脑原来的 Codex 桌面实例。
 
-An unofficial Android companion for monitoring and controlling existing Codex desktop chats on multiple Windows PCs over a private Tailscale network. No central relay, cloud account transfer, or replacement model backend.
+An unofficial Android companion for monitoring and controlling existing Codex desktop chats on multiple Windows PCs over a local network or private Tailscale connection. No central relay, cloud account transfer, or replacement model backend.
 
 **实验性预览，不是 OpenAI 官方产品，也未经独立安全审计。** 不再因 Codex 桌面版本号或归档哈希不同而锁定控制，改为连接时检查原生协议、操作时按功能校验；不承诺任意新版兼容。两台物理 PC 联合验收及 Fork 真正创建端到端验收仍待完成。
 
@@ -10,16 +10,16 @@ An unofficial Android companion for monitoring and controlling existing Codex de
 
 在本仓库的 [Releases](https://github.com/faithererer/codex-remote/releases) 下载 Android APK 和 Windows x64 便携包。每台电脑独立运行一个桥接并分别配对；不设置两台电脑的产品限制。
 
-- Android：`codex-remote-0.1.4-android.apk`，Android 10 或更新版本。同一发行者的覆盖更新保留配对，不要先卸载。
-- Windows：`codex-remote-0.1.4-windows-x64.zip`，自包含便携程序，无需另装 .NET Runtime。
+- Android：`codex-remote-0.1.5-android.apk`，Android 10 或更新版本。同一发行者的覆盖更新保留配对，不要先卸载。
+- Windows：`codex-remote-0.1.5-windows-x64.zip`，自包含便携程序，无需另装 .NET Runtime。
 - 发布页同时提供源码和 `SHA256SUMS.txt`。源码使用 MIT 许可证；第三方依赖遵守各自许可证。
 - 自行构建使用自己的签名密钥；不同签名不能覆盖安装维护者的 APK。私钥不随源码或 Release 公开。
 
 ## 使用
 
 1. 手机安装发布页中的 Android APK；覆盖更新保留原配对，不需要卸载。
-2. 每台电脑解压 Windows 便携包，运行 `CodexRemote.exe`。电脑上照常启动原 Codex，手机、电脑都连接自己的 Tailscale。
-3. 手机点“添加”，扫描电脑的配对二维码；再在电脑窗口确认。另一台电脑重复相同步骤。
+2. 每台电脑解压 Windows 便携包，运行 `CodexRemote.exe`。电脑上照常启动原 Codex；手机与电脑在同一 Wi-Fi／局域网时，无需开启或安装 Tailscale。外出时仍可使用两端的 Tailscale。
+3. 在电脑桥接的“选择配对网络”中选择局域网或 Tailscale 地址；手机点“添加”扫码，再在电脑确认。另一台电脑重复相同步骤。
 4. “全部关注”同时显示各电脑任务。进入任务可查看历史、实时输出，发送文字指令、追加指示、中断、处理命令／文件审批及普通选择题。
 5. 尚未加载到桌面的历史会话，点“在电脑打开这个现有会话并接入”。这只打开原会话，不创建新任务，但会切换电脑上的当前 Codex 页面。
 6. 想在退出 App 后继续接收提醒，主动开启“离开应用后继续关注”，并允许系统通知。锁屏通知默认不显示对话正文。
@@ -28,9 +28,11 @@ An unofficial Android companion for monitoring and controlling existing Codex de
 9. 输入框上方点模型名，可选择该电脑当前提供商配置目录中的模型和思考强度，应用到本会话下一轮，不中断正在运行的任务、不修改全局配置。该目录不可验证时只显示当前模型，不猜测另一台电脑的可用模型。
 10. 点“编辑最新消息”，修改后确认“修改并重新生成”。这会用原桌面的编辑流程撤回本轮对话并重新生成，不会还原已经改动的文件。运行中不能提交；带追加消息、附件、结构化上下文或自定义权限的轮次保守地留给电脑处理。
 
-旧桥接显示“版本未验证，远程控制已锁定”时，需要在那台电脑更新 **Windows 桥接** 到 0.1.4；只更新手机不会改变旧桥接的限制。不需要降级 Codex、重新配对或重启正在执行的 Codex。
+旧桥接显示“版本未验证，远程控制已锁定”时，需要在那台电脑更新 **Windows 桥接** 到 0.1.4 或更新版本；只更新手机不会改变旧桥接的限制。不需要降级 Codex、重新配对或重启正在执行的 Codex。
 
-Android 通常只能启用一个 VPN。若当前使用 Clash 等其他 VPN，需由用户先切换到 Tailscale；仅安装 Tailscale 而未连接时不能访问电脑。配对页提供“打开 Tailscale”按钮，不会自动改动其他 VPN 的配置。
+**原来已通过 Tailscale 配对的电脑不用删掉重配。** 两端更新到 0.1.5 后，手机进入“我的电脑 → 修改连接地址”，填写电脑窗口“复制连接地址”得到的局域网地址。程序先固定校验证书、凭证及原电脑身份，成功才保存；草稿、关注、未读和未确认操作都保留。外出时可用同一入口改回 Tailscale 地址，不自动换地址重发指令。
+
+Android 通常只能启用一个 VPN。局域网直连无需切换到 Tailscale；若 Clash 等 VPN 接管局域网流量，请配置绕过局域网。只有外出使用 Tailscale 时才需要切换并连接该 VPN。详细连接与防火墙排查见 [局域网使用说明](docs/LAN.md)。
 
 ## 手机会话视图
 
@@ -87,7 +89,9 @@ Android 通常只能启用一个 VPN。若当前使用 Clash 等其他 VPN，需
 
 ## 安全与回退
 
-Windows 只绑定 Tailscale IPv4 地址的 `48761/TCP`，拒绝非 `100.64.0.0/10` 来源，不启用 Funnel。若 Windows 防火墙拦截，应只允许该程序在 Tailscale 私网上通信，不应关闭防火墙或开放公网端口。
+Windows 在已连接的以太网／Wi-Fi 私有 IPv4 地址及 Tailscale IPv4 地址上监听 `48761/TCP`。局域网支持 `10.0.0.0/8`、`172.16.0.0/12`、`192.168.0.0/16`；Tailscale 支持 `100.64.0.0/10`。不绑定通配地址、公网 IPv4、回环或 IPv6，不启用 Funnel。局域网入口只接受 RFC1918 来源，Tailscale 入口只接受对应私网来源；这些地址检查不代替认证。
+
+监听地址变化约 5 秒后自动重新检测并绑定，沿用同一身份、事件实例和操作去重锁。手机保存的地址若因 DHCP 改变，需要手动更新；不会自动猜测另一台电脑。Windows 防火墙若提示网络访问，请仅允许此程序在自己的局域网中通信，不应关闭防火墙或开放公网端口；程序不自动改动防火墙、网络类别或 VPN。
 
 配对码有效 5 分钟且一次性使用；电脑确认后才发设备凭证。Android 固定校验证书，使用 Android Keystore 加密本地数据；Windows 用当前用户 DPAPI 保护证书、设备记录和操作去重记录。凭证、证书私钥、APK 签名私钥不包含在交付包中。
 
@@ -106,7 +110,7 @@ Windows 只绑定 Tailscale IPv4 地址的 `48761/TCP`，拒绝非 `100.64.0.0/1
 
 将工具放在源码目录相邻的 `toolchains/`，或通过 `CODEX_DOTNET`、`CODEX_GRADLE`、`JAVA_HOME`、`ANDROID_HOME` 指定绝对路径。自行生成签名密钥后设置 `CODEX_SIGNING_STORE`、`CODEX_SIGNING_PASSWORD`，运行 `node tools/build.mjs`。构建脚本不附带也不会打印签名密码。
 
-自测命令：`CodexRemote.exe --self-test result.json`、`--api-test api-result.json`、`--smoke smoke.json`。API 自测在一台 PC 的 Tailscale 私网临时使用 `48762/48763`，不等于两台物理 PC 测试。`--smoke` 只读原桌面，不发送任务指令。
+自测命令：`CodexRemote.exe --self-test result.json`、`--api-test api-result.json`、`--smoke smoke.json`。API 自测在一台 PC 的私网地址临时使用 `48762/48763`，优先局域网，并在两种网络均存在时验证共同身份与去重；不等于两台物理 PC 测试。`--smoke` 只读原桌面，不发送任务指令。
 
 详细构建步骤见 [docs/BUILDING.md](docs/BUILDING.md)，验证范围见 [docs/VERIFICATION.md](docs/VERIFICATION.md)，接口见 [docs/PROTOCOL.md](docs/PROTOCOL.md)。CI 只构建和执行隔离测试，不连接维护者的电脑、不使用发行签名私钥，也不操作真实对话。
 

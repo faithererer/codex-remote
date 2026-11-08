@@ -10,11 +10,19 @@ security certification.
 - Every paired phone is a trusted operator of that PC's Codex tasks. A paired
   device can read task output, submit instructions and answer supported approvals.
   There is no read-only account or per-project access control in this preview.
-- Use your own trusted Tailscale devices and restrictive tailnet access policies.
-  The bridge accepts the Tailscale IPv4 range, but this is not an additional
-  cryptographic verification of the source Tailscale node identity.
-- The bridge binds only to its Tailscale address. Do not use Funnel, public
-  reverse proxies, public port forwarding, or disable the Windows firewall.
+- Since 0.1.5, a trusted local network can be used without Tailscale. The bridge
+  listens on active Ethernet/Wi-Fi RFC1918 IPv4 addresses and the Tailscale IPv4
+  address. LAN listeners accept RFC1918 sources; Tailscale listeners accept the
+  Tailscale IPv4 range. Private IP checks do not authenticate a LAN device or a
+  Tailscale node. Use trusted networks and restrictive tailnet access policies.
+- The bridge never binds wildcard, public, loopback or IPv6 addresses. Do not use
+  Funnel, public reverse proxies, public port forwarding, or disable the Windows
+  firewall. The app does not change firewall rules, network profiles or VPNs.
+- Switching a paired PC's address requires the same pinned leaf certificate,
+  existing device credential and host ID before saving. The connection is
+  replaced for that PC; its pending operations, drafts and trust remain intact.
+  A new IP address does not establish new trust or cause automatic resubmission.
+  Both listeners use one operation journal and mutex, including network rebinds.
 - Pairing requires a five-minute one-use credential and a PC confirmation. Android
   pins the certificate and protects local credentials with Keystore; Windows uses
   current-user DPAPI. Protect both devices and their signed-in OS accounts.

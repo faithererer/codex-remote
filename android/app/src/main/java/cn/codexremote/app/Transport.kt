@@ -33,15 +33,12 @@ data class PairCode(val host: Host, val secret: String) {
             val j = JSONObject(text.trim())
             require(j.getInt("v") == 1) { "不支持的配对码版本" }
             val id = j.getString("hostId"); UUID.fromString(id)
-            val uri = URI(j.getString("url"))
-            require(uri.scheme == "https" && uri.userInfo == null && uri.rawQuery == null && uri.fragment == null && uri.path.isNullOrEmpty() && uri.port in 1..65535) { "连接地址不安全" }
-            val octets = uri.host?.split('.')?.map { it.toIntOrNull() ?: -1 } ?: emptyList()
-            require(octets.size == 4 && octets[0] == 100 && octets[1] in 64..127 && octets.all { it in 0..255 }) { "只接受 Tailscale 私网 IPv4 地址" }
+            val url = bridgeUrl(j.getString("url"))
             val pin = j.getString("fingerprint").lowercase(); val secret = j.getString("secret")
             require(pin.matches(Regex("[0-9a-f]{64}")) && secret.matches(Regex("[0-9a-f]{64}"))) { "配对码不完整" }
             val expiry = java.time.Instant.parse(j.getString("expiresAt")).toEpochMilli()
             require(expiry > now && expiry <= now + 6 * 60 * 1000) { "二维码已过期，请在电脑上刷新" }
-            return PairCode(Host(id, j.optString("name", "电脑"), uri.toString(), pin, "", ""), secret)
+            return PairCode(Host(id, j.optString("name", "电脑"), url, pin, "", ""), secret)
         }
     }
 }
@@ -73,11 +70,15 @@ class SecureStore(context: Context) {
 
 fun JSONArray.objects(): List<JSONObject> = (0 until length()).mapNotNull { optJSONObject(it) }
 
-fun connectionMessage(error: Throwable): String {
+fun connectionMessage(error: Throwable, url: String? = null): String {
     val causes = generateSequence(error) { it.cause }.take(12).toList()
     if (causes.any { it is java.security.cert.CertificateException || it is javax.net.ssl.SSLPeerUnverifiedException }) return "电脑证书校验失败，连接已拒绝。请在电脑核对证书后重新配对。"
-    if (error is java.io.IOException) return "无法连接电脑。请先连接手机的 Tailscale（Clash 等 VPN 可能需要切换），并确认电脑桥接正在运行。"
-    return error.message ?: "连接失败，请检查 Tailscale 和电脑桥接。"
+    if (error is java.io.IOException) return when (url?.let { runCatching { connectionKind(it) }.getOrNull() }) {
+        "局域网" -> "局域网无法连接电脑。请确认手机与电脑在同一网络、地址未改变、桥接正在运行；检查防火墙、VPN 绕过局域网及 Wi-Fi 客户端隔离。"
+        "Tailscale" -> "无法连接电脑的 Tailscale 地址。请确认两端 Tailscale 已连接；同一局域网可在“我的电脑 → 修改连接地址”切换直连。"
+        else -> "无法连接电脑。局域网请确认同一网络、电脑地址和防火墙；外出使用 Tailscale 时确认两端已连接。"
+    }
+    return error.message ?: "连接失败，请检查当前网络和电脑桥接。"
 }
 
 class HostApi(val host: Host) {
@@ -87,6 +88,7 @@ class HostApi(val host: Host) {
     private val closing = java.util.concurrent.atomic.AtomicBoolean(false)
     val client: OkHttpClient
     init {
+        require(bridgeUrl(host.url) == host.url) { "保存的电脑地址无效，请在电脑管理中修改连接地址" }
         val trust = object : X509TrustManager {
             override fun getAcceptedIssuers(): Array<X509Certificate> = emptyArray()
             override fun checkClientTrusted(chain: Array<X509Certificate>, authType: String) = throw java.security.cert.CertificateException("Client certificates not supported")

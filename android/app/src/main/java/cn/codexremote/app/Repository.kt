@@ -37,6 +37,7 @@ class Repository(private val context: Context) {
     private val selected = ConcurrentHashMap.newKeySet<ThreadKey>()
     private val signals = ConcurrentHashMap<ThreadKey, JSONObject>()
     private val operationGate = OperationGate()
+    private fun ownsApi(id: String, api: HostApi) = apis[id] === api && states.value[id]?.host?.url == api.host.url
     private var visible = false
     var notify: ((Notice) -> Unit)? = null
     init {
@@ -81,6 +82,27 @@ class Repository(private val context: Context) {
             host.name
         } finally { api.close() }
     }
+    suspend fun changeAddress(id: String, value: String) = withContext(Dispatchers.IO) {
+        operationGate.run(id) {
+            val original = states.value[id]?.host ?: error("电脑已移除")
+            val candidate = original.copy(url = connectionAddress(value))
+            val api = HostApi(candidate)
+            try {
+                val verified = hostAtVerifiedAddress(original, candidate.url, api.request("/api/v1/status"))
+                synchronized(this@Repository) {
+                    val current = states.value[id]?.host ?: error("电脑已移除")
+                    require(current.url == original.url && current.fingerprint == original.fingerprint && current.token == original.token) { "配对或地址已变化，请重新打开设置" }
+                    // Persist only the verified URL. Pending operations, drafts and trust stay on this host.
+                    val next = current.copy(url = verified.url)
+                    store.save(states.value.values.map { if (it.host.id == id) next else it.host })
+                    jobs.remove(id)?.cancel(); apis.remove(id)?.close()
+                    histories.update { all -> all.filterKeys { it.hostId != id } }
+                    states.update { all -> all + (id to HostState(next)) }
+                    reconcile()
+                }
+            } finally { api.close() }
+        }
+    }
     private suspend fun connect(id: String) {
         var backoff = 1000L; var disconnectedAt = 0L; var warned = false; var sequence = 0L; var instance = ""
         while (currentCoroutineContext().isActive && states.value.containsKey(id)) {
@@ -88,6 +110,7 @@ class Repository(private val context: Context) {
             val api = HostApi(host); apis.put(id, api)?.close()
             try {
                 val status = api.request("/api/v1/status")
+                if (!ownsApi(id, api)) throw CancellationException("连接地址已更改")
                 require(status.getString("hostId") == id) { "电脑身份不匹配" }
                 val next = status.getString("instanceId")
                 if (next != instance) { instance = next; sequence = 0; histories.update { all -> all.filterKeys { it.hostId != id } } }
@@ -98,6 +121,7 @@ class Repository(private val context: Context) {
                 suspendCancellableCoroutine<Unit> { continuation ->
                     val socket = api.events(instance, sequence, object : WebSocketListener() {
                         override fun onMessage(webSocket: WebSocket, text: String) {
+                            if (!ownsApi(id, api)) return
                             try {
                                 val event = JSONObject(text); val eventInstance = event.optString("instanceId")
                                 if (eventInstance != instance || event.optString("type") == "reset") {
@@ -136,8 +160,9 @@ class Repository(private val context: Context) {
             } catch (cancel: CancellationException) { throw cancel }
             catch (e: Exception) {
                 if (disconnectedAt == 0L) disconnectedAt = System.currentTimeMillis()
-                states.update { all -> all[id]?.let { all + (id to it.copy(online = false, error = connectionMessage(e))) } ?: all }
-                if (!warned && monitoring.value && System.currentTimeMillis() - disconnectedAt > 60000) { warned = true; notify?.invoke(Notice(id, "", host.name, "持续断连，请检查电脑和 Tailscale")) }
+                if (!ownsApi(id, api)) throw CancellationException("连接地址已更改")
+                states.update { all -> all[id]?.let { all + (id to it.copy(online = false, error = connectionMessage(e, host.url))) } ?: all }
+                if (!warned && monitoring.value && System.currentTimeMillis() - disconnectedAt > 60000) { warned = true; notify?.invoke(Notice(id, "", host.name, "持续断连，请检查电脑和当前网络")) }
             } finally { apis.remove(id, api); api.close() }
             delay(backoff + kotlin.random.Random.nextLong(500)); backoff = (backoff * 2).coerceAtMost(30000)
         }
@@ -146,8 +171,9 @@ class Repository(private val context: Context) {
     private suspend fun refresh(id: String, api: HostApi) {
         try {
             val status = api.request("/api/v1/status"); require(status.getString("hostId") == id)
+            if (!ownsApi(id, api)) return
             states.update { all -> all[id]?.let { all + (id to it.copy(online = status.optBoolean("desktopConnected"), compatible = status.optBoolean("compatible"), instance = status.getString("instanceId"), error = status.optString("error"))) } ?: all }
-            val result = api.request("/api/v1/threads"); require(result.getString("hostId") == id); updateCatalog(id, result.getJSONArray("threads"))
+            val result = api.request("/api/v1/threads"); require(result.getString("hostId") == id); if (ownsApi(id, api)) updateCatalog(id, result.getJSONArray("threads"))
         }
         catch (e: Exception) { if (e is CancellationException) throw e; message.value = "${states.value[id]?.host?.name}：${e.message}" }
     }
@@ -156,7 +182,7 @@ class Repository(private val context: Context) {
     fun unwatch(key: ThreadKey) { selected.remove(key) }
     private suspend fun load(key: ThreadKey) {
         val api = apis[key.hostId] ?: return
-        try { val view = api.request("/api/v1/threads/${key.threadId}"); if (view.optString("instanceId") == states.value[key.hostId]?.instance) histories.update { it + (key to view) } }
+        try { val view = api.request("/api/v1/threads/${key.threadId}"); if (ownsApi(key.hostId, api) && view.optString("instanceId") == states.value[key.hostId]?.instance) histories.update { it + (key to view) } }
         catch (e: Exception) { if (e is CancellationException) throw e; message.value = e.message ?: "读取失败" }
     }
     suspend fun operate(key: ThreadKey, type: String, fields: JSONObject = JSONObject()): String = withContext(Dispatchers.IO) {

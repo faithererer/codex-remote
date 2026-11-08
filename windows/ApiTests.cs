@@ -14,16 +14,16 @@ static class ApiTests
         var results = new List<object>();
         async Task Test(string name, Func<Task> action) { try { await action(); results.Add(new { name, passed = true }); } catch (Exception e) { results.Add(new { name, passed = false, error = e.ToString() }); } }
         static void Check(bool value, string message = "Assertion failed") { if (!value) throw new Exception(message); }
-        var ip = Program.TailscaleAddress();
-        if (ip is null) { File.WriteAllText(output!, J.Node(new { skipped = "No local Tailscale IPv4", realTwoPcTested = false }).ToJsonString()); return; }
+        var endpoints = PrivateNetwork.Endpoints(); var ip = endpoints.FirstOrDefault()?.Address;
+        if (ip is null) { File.WriteAllText(output!, J.Node(new { skipped = "No local LAN or Tailscale IPv4", realTwoPcTested = false }).ToJsonString()); return; }
         var root = Path.Combine(Path.GetTempPath(), "CodexRemote-api-test-" + Guid.NewGuid());
         var va = new Vault(Path.Combine(root, "a")); var vb = new Vault(Path.Combine(root, "b"));
         var ia = Identity.Load(va); var ib = Identity.Load(vb);
         var pa = new Pairing(va, ia) { Confirm = _ => Task.FromResult(true) }; var pb = new Pairing(vb, ib) { Confirm = _ => Task.FromResult(true) };
         var ea = new EventHub(); var eb = new EventHub(); await using var da = new Desktop(ea); await using var db = new Desktop(eb);
         using var cancel = new CancellationTokenSource();
-        var sa = Program.StartServer(ip, ia, pa, ea, da, va, cancel.Token, 48762); var sb = Program.StartServer(ip, ib, pb, eb, db, vb, cancel.Token, 48763);
-        HttpClient Client(Identity id, int port, bool wrongPin = false) => new(new HttpClientHandler { UseProxy = false, ServerCertificateCustomValidationCallback = (_, cert, _, _) => cert != null && Convert.ToHexString(SHA256.HashData(cert.RawData)).ToLowerInvariant() == (wrongPin ? new string('0', 64) : id.Fingerprint) }) { BaseAddress = new Uri($"https://{ip}:{port}"), Timeout = TimeSpan.FromSeconds(10) };
+        var sa = Program.StartServer(endpoints.Select(e => e.Address).ToArray(), ia, pa, ea, da, va, cancel.Token, 48762); var sb = Program.StartServer(ip, ib, pb, eb, db, vb, cancel.Token, 48763);
+        HttpClient Client(Identity id, int port, bool wrongPin = false, IPAddress? address = null) => new(new HttpClientHandler { UseProxy = false, ServerCertificateCustomValidationCallback = (_, cert, _, _) => cert != null && Convert.ToHexString(SHA256.HashData(cert.RawData)).ToLowerInvariant() == (wrongPin ? new string('0', 64) : id.Fingerprint) }) { BaseAddress = new Uri($"https://{address ?? ip}:{port}"), Timeout = TimeSpan.FromSeconds(10) };
         using var a = Client(ia, 48762); using var b = Client(ib, 48763);
         static async Task<HttpResponseMessage> Post(HttpClient client, string path, JsonNode body) => await client.PostAsync(path, new StringContent(body.ToJsonString(), Encoding.UTF8, "application/json"));
         JsonNode Qr(Pairing pairing, Identity identity, int port) => JsonNode.Parse(pairing.CreateQr($"https://{ip}:{port}"))!;
@@ -45,6 +45,26 @@ static class ApiTests
                 a.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", ta); b.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", tb);
             });
             await Test("Used QR cannot pair twice", async () => { using var response = await Post(a, "/api/v1/pair", Body(qa, ia)); Check(response.StatusCode == HttpStatusCode.Forbidden); });
+            await Test("Private listener checks peer address rather than untrusted forwarding headers", async () => {
+                using var request = new HttpRequestMessage(HttpMethod.Get, "/api/v1/status"); request.Headers.Add("X-Forwarded-For", "8.8.8.8");
+                using var response = await a.SendAsync(request); Check(response.IsSuccessStatusCode);
+            });
+            if (endpoints.Any(e => e.Tailscale) && endpoints.Any(e => !e.Tailscale))
+            {
+                var otherIp = endpoints.First(e => e.Tailscale).Address;
+                using var other = Client(ia, 48762, address: otherIp); other.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", ta);
+                await Test("LAN and Tailscale keep the same certificate host and backend instance", async () => {
+                    var status = JsonNode.Parse(await a.GetStringAsync("/api/v1/status"))!; var alternate = JsonNode.Parse(await other.GetStringAsync("/api/v1/status"))!;
+                    Check(status.S("hostId") == alternate.S("hostId") && status.S("instanceId") == alternate.S("instanceId"));
+                });
+                await Test("Both network addresses share the operation journal without duplicate dispatch", async () => {
+                    var body = J.Node(new { hostId = ia.HostId, instanceId = ea.InstanceId, threadId = Guid.NewGuid(), operationId = Guid.NewGuid(), type = "interrupt", turnId = "test-never-dispatched" });
+                    using var first = await Post(a, "/api/v1/operations", body); using var replay = await Post(other, "/api/v1/operations", body);
+                    Check(first.IsSuccessStatusCode && replay.IsSuccessStatusCode);
+                    Check(JsonNode.DeepEquals(JsonNode.Parse(await first.Content.ReadAsStringAsync()), JsonNode.Parse(await replay.Content.ReadAsStringAsync())));
+                    body["turnId"] = "changed"; using var conflict = await Post(other, "/api/v1/operations", body); Check(conflict.StatusCode == HttpStatusCode.Conflict);
+                });
+            }
             await Test("Host A credentials rejected by host B", async () => { using var other = Client(ib, 48763); other.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", ta); using var response = await other.GetAsync("/api/v1/status"); Check(response.StatusCode == HttpStatusCode.Unauthorized); });
             await Test("Identical thread IDs cannot route operation to other host", async () => { using var response = await Post(b, "/api/v1/operations", J.Node(new { hostId = ia.HostId, instanceId = eb.InstanceId, threadId = "11111111-1111-4111-8111-111111111111", operationId = Guid.NewGuid(), type = "interrupt", turnId = "test-never-dispatched" })); Check(response.StatusCode == HttpStatusCode.Conflict); });
             await Test("Old backend instance cannot dispatch", async () => { var old = ea.InstanceId; ea.Reset(); using var response = await Post(a, "/api/v1/operations", J.Node(new { hostId = ia.HostId, instanceId = old, threadId = Guid.NewGuid(), operationId = Guid.NewGuid(), type = "send", text = "MUST NEVER DISPATCH" })); Check(response.StatusCode == HttpStatusCode.Conflict); });
@@ -86,6 +106,6 @@ static class ApiTests
             await Test("Revoking A leaves B authorized", async () => { pa.Revoke(deviceA); using var ra = await a.GetAsync("/api/v1/status"); using var rb = await b.GetAsync("/api/v1/status"); Check(ra.StatusCode == HttpStatusCode.Unauthorized && rb.IsSuccessStatusCode); });
         }
         finally { cancel.Cancel(); try { await Task.WhenAll(sa, sb); } catch (OperationCanceledException) { } }
-        File.WriteAllText(output ?? Path.Combine(root, "results.json"), J.Node(new { results, testTopology = "Two isolated bridge identities on one real PC, two private HTTPS ports; not two physical PCs", liveCommandsSent = 0, realTwoPcTested = false, realAndroidTested = false }).ToJsonString(new() { WriteIndented = true }));
+        File.WriteAllText(output ?? Path.Combine(root, "results.json"), J.Node(new { results, primaryTransport = PrivateNetwork.IsLan(ip) ? "LAN" : "Tailscale", listenerTransports = endpoints.Select(e => e.Tailscale ? "Tailscale" : "LAN").Distinct(), testTopology = "Two isolated bridge identities on one real PC, private HTTPS ports; not two physical PCs", liveCommandsSent = 0, realTwoPcTested = false, realAndroidTested = false }).ToJsonString(new() { WriteIndented = true }));
     }
 }

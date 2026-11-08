@@ -1,6 +1,5 @@
 using System.Diagnostics;
 using System.Net;
-using System.Net.NetworkInformation;
 using System.Net.WebSockets;
 using System.Text;
 using System.Text.Json.Nodes;
@@ -33,9 +32,8 @@ static class Program
             using var cancel = new CancellationTokenSource();
             using var window = new MainWindow(identity, pairing, desktop, vault);
             pairing.Confirm = name => window.ConfirmPair(name);
-            var ip = TailscaleAddress();
-            window.Endpoint = ip is null ? "" : "https://" + ip + ":48761";
-            var server = StartServer(ip ?? IPAddress.Loopback, identity, pairing, events, desktop, vault, cancel.Token);
+            _ = window.Handle;
+            var server = Task.Run(() => ListenNetworks(identity, pairing, events, desktop, vault, window, cancel.Token));
             _ = Task.Run(() => desktop.Monitor(cancel.Token));
             _ = server.ContinueWith(t => { if (t.IsFaulted) window.SetError("服务无法启动（端口或防火墙）：" + t.Exception?.GetBaseException().Message); });
             Application.Run(window);
@@ -43,25 +41,53 @@ static class Program
         }
         catch (Exception e) { MessageBox.Show(e.Message, "启动失败", MessageBoxButtons.OK, MessageBoxIcon.Error); }
     }
-    public static bool Tailnet(IPAddress? address)
+    public static bool Tailnet(IPAddress? address) => PrivateNetwork.IsTailscale(address);
+    static async Task ListenNetworks(Identity identity, Pairing pairing, EventHub events, Desktop desktop, Vault vault, MainWindow window, CancellationToken cancellation)
     {
-        if (address == null) return false; if (address.IsIPv4MappedToIPv6) address = address.MapToIPv4();
-        var bytes = address.GetAddressBytes(); return bytes.Length == 4 && bytes[0] == 100 && bytes[1] >= 64 && bytes[1] < 128;
+        var operations = new Operations(vault);
+        Task? listener = null; CancellationTokenSource? connection = null; string current = "";
+        try
+        {
+            while (!cancellation.IsCancellationRequested)
+            {
+                var endpoints = PrivateNetwork.Endpoints();
+                var key = string.Join("|", endpoints.Select(e => e.Address));
+                if (key != current || listener?.IsCompleted == true)
+                {
+                    if (connection != null) { connection.Cancel(); try { if (listener != null) await listener; } catch { } connection.Dispose(); connection = null; }
+                    current = key; listener = null;
+                    window.SetNetworks([]);
+                    if (endpoints.Length > 0)
+                    {
+                        connection = CancellationTokenSource.CreateLinkedTokenSource(cancellation);
+                        // Both transports share one operation journal and lock, including across rebinds.
+                        listener = StartServer(endpoints.Select(e => e.Address).ToArray(), identity, pairing, events, desktop, vault, connection.Token, operations: operations, started: () => window.SetNetworks(endpoints));
+                        _ = listener.ContinueWith(t => { if (t.IsFaulted) window.SetError("网络监听无法启动：请检查端口占用或本机地址，5 秒后重试。"); }, TaskScheduler.Default);
+                    }
+                }
+                await Task.Delay(5000, cancellation);
+            }
+        }
+        catch (OperationCanceledException) when (cancellation.IsCancellationRequested) { }
+        finally { if (connection != null) { connection.Cancel(); try { if (listener != null) await listener; } catch { } connection.Dispose(); } }
     }
-    internal static IPAddress? TailscaleAddress() => NetworkInterface.GetAllNetworkInterfaces().Where(n => n.Name.Contains("tailscale", StringComparison.OrdinalIgnoreCase) || n.Description.Contains("tailscale", StringComparison.OrdinalIgnoreCase)).SelectMany(n => n.GetIPProperties().UnicastAddresses).Select(a => a.Address).FirstOrDefault(Tailnet);
 
-    internal static async Task StartServer(IPAddress ip, Identity identity, Pairing pairing, EventHub events, Desktop desktop, Vault vault, CancellationToken cancellation, int port = 48761)
+    internal static Task StartServer(IPAddress ip, Identity identity, Pairing pairing, EventHub events, Desktop desktop, Vault vault, CancellationToken cancellation, int port = 48761)
+        => StartServer([ip], identity, pairing, events, desktop, vault, cancellation, port);
+    internal static async Task StartServer(IReadOnlyList<IPAddress> addresses, Identity identity, Pairing pairing, EventHub events, Desktop desktop, Vault vault, CancellationToken cancellation, int port = 48761, Operations? operations = null, Action? started = null)
     {
+        if (addresses.Count == 0 || addresses.Any(ip => !PrivateNetwork.IsListener(ip))) throw new InvalidOperationException("只允许监听局域网或 Tailscale 的具体 IPv4 地址");
         var builder = WebApplication.CreateSlimBuilder();
         builder.Logging.ClearProviders(); // Avoid logging bearer credentials, prompts, or pairing secrets.
-        builder.WebHost.ConfigureKestrel(options => { options.Limits.MaxRequestBodySize = 192 * 1024; options.Limits.RequestHeadersTimeout = TimeSpan.FromSeconds(10); options.Listen(ip, port, endpoint => { endpoint.Protocols = HttpProtocols.Http1AndHttp2; endpoint.UseHttps(identity.GetCertificate()); }); });
-        var app = builder.Build(); var operations = new Operations(vault); var pairAttempts = new System.Collections.Concurrent.ConcurrentDictionary<string, (DateTimeOffset Window, int Count)>();
+        builder.WebHost.ConfigureKestrel(options => { options.Limits.MaxRequestBodySize = 192 * 1024; options.Limits.RequestHeadersTimeout = TimeSpan.FromSeconds(10); foreach (var ip in addresses.Distinct()) options.Listen(ip, port, endpoint => { endpoint.Protocols = HttpProtocols.Http1AndHttp2; endpoint.UseHttps(identity.GetCertificate()); }); });
+        await using var app = builder.Build(); operations ??= new Operations(vault); var pairAttempts = new System.Collections.Concurrent.ConcurrentDictionary<string, (DateTimeOffset Window, int Count)>();
+        if (started != null) app.Lifetime.ApplicationStarted.Register(started);
         app.Use(async (context, next) =>
         {
             context.Response.Headers.CacheControl = "no-store";
             try
             {
-                if (!Tailnet(context.Connection.RemoteIpAddress)) throw new ApiError(403, "仅接受 Tailscale 私有网络连接");
+                if (!PrivateNetwork.Allows(context.Connection.RemoteIpAddress, context.Connection.LocalIpAddress)) throw new ApiError(403, "仅接受当前局域网或 Tailscale 私网的对应连接");
                 if (context.Request.Path != "/api/v1/pair")
                 {
                     var header = context.Request.Headers.Authorization.ToString();
@@ -153,7 +179,7 @@ static class Program
     }
     static async Task PhoneTest(string output)
     {
-        var ip = TailscaleAddress() ?? throw new Exception("No Tailscale address");
+        var ip = PrivateNetwork.Endpoints().FirstOrDefault()?.Address ?? throw new Exception("No private IPv4 address");
         var root = Path.Combine(Path.GetTempPath(), "CodexRemote-phone-test-" + Guid.NewGuid());
         var va = new Vault(Path.Combine(root, "a")); var vb = new Vault(Path.Combine(root, "b")); var ia = Identity.Load(va); var ib = Identity.Load(vb);
         ia.Name = "TEST PC A"; ib.Name = "TEST PC B";
@@ -173,17 +199,17 @@ sealed class MainWindow : Form
     readonly PictureBox qr = new() { Width = 320, Height = 320, SizeMode = PictureBoxSizeMode.Zoom, BackColor = Color.White };
     readonly Label status = new() { AutoSize = false, Height = 76, Dock = DockStyle.Top };
     readonly Label address = new() { AutoSize = false, Height = 42, Dock = DockStyle.Top };
+    readonly ComboBox networks = new() { DropDownStyle = ComboBoxStyle.DropDownList, Width = 550, DisplayMember = "Label" };
     readonly ListBox devices = new() { Height = 90, Dock = DockStyle.Top, DisplayMember = "Name" };
     readonly NotifyIcon tray;
     readonly System.Windows.Forms.Timer timer = new() { Interval = 1000 };
-    string code = "", failure = ""; DateTimeOffset expires;
+    string code = "", failure = "", preferredAddress = ""; DateTimeOffset expires;
     bool exiting;
-    [System.ComponentModel.DesignerSerializationVisibility(System.ComponentModel.DesignerSerializationVisibility.Hidden)]
-    public string Endpoint { get; set; } = "";
+    string Endpoint => (networks.SelectedItem as NetworkEndpoint)?.Url ?? "";
     public MainWindow(Identity identity, Pairing pairing, Desktop desktop, Vault vault)
     {
         this.identity = identity; this.pairing = pairing; this.desktop = desktop; this.vault = vault;
-        Text = "Codex 远程控制 · 电脑桥接"; Width = 620; Height = 850; MinimumSize = new Size(530, 760); Font = new Font("Microsoft YaHei UI", 10); BackColor = Color.FromArgb(243, 246, 242);
+        Text = "Codex 远程控制 · 电脑桥接"; Width = 620; Height = 900; MinimumSize = new Size(530, 800); Font = new Font("Microsoft YaHei UI", 10); BackColor = Color.FromArgb(243, 246, 242);
         var root = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.TopDown, WrapContents = false, Padding = new Padding(22), AutoScroll = true };
         Controls.Add(root);
         root.Controls.Add(new Label { Text = "把这台电脑带到手机上", Font = new Font(Font.FontFamily, 20, FontStyle.Bold), Width = 550, Height = 46 });
@@ -191,27 +217,41 @@ sealed class MainWindow : Form
         var rename = new Button { Text = "保存电脑名", AutoSize = true }; rename.Click += (_, _) => { var value = name.Text.Trim(); if (value.Length is < 1 or > 60) return; identity.Name = value; vault.Write("identity", identity); RefreshPair(); };
         var nameRow = new FlowLayoutPanel { Width = 550, Height = 40 }; nameRow.Controls.Add(name); nameRow.Controls.Add(rename); root.Controls.Add(nameRow);
         status.Width = 550; root.Controls.Add(status); address.Width = 550; root.Controls.Add(address);
+        root.Controls.Add(new Label { Text = "选择配对网络：同一局域网无需 Tailscale，外出时选 Tailscale", AutoSize = true });
+        root.Controls.Add(networks); networks.SelectedIndexChanged += (_, _) => { if (Endpoint.Length > 0) preferredAddress = Endpoint; RefreshPair(); };
         root.Controls.Add(qr);
         var buttons = new FlowLayoutPanel { Width = 550, Height = 46 };
         var refresh = new Button { Text = "刷新配对码", AutoSize = true }; refresh.Click += (_, _) => RefreshPair(); buttons.Controls.Add(refresh);
         var copy = new Button { Text = "复制配对码", AutoSize = true }; copy.Click += (_, _) => { if (DateTimeOffset.UtcNow < expires && code.Length > 0) Clipboard.SetText(code); }; buttons.Controls.Add(copy);
+        var copyAddress = new Button { Text = "复制连接地址", AutoSize = true }; copyAddress.Click += (_, _) => { if (Endpoint.Length > 0) Clipboard.SetText(Endpoint); }; buttons.Controls.Add(copyAddress);
         var launch = new Button { Text = "打开 Codex", AutoSize = true }; launch.Click += (_, _) => Process.Start(new ProcessStartInfo("explorer.exe", @"shell:AppsFolder\OpenAI.Codex_2p2nqsd0c76g0!App") { UseShellExecute = true }); buttons.Controls.Add(launch); root.Controls.Add(buttons);
         root.Controls.Add(new Label { Text = "已配对设备（撤销立即断开，不影响其他电脑）", AutoSize = true });
         devices.Width = 550; root.Controls.Add(devices);
         var revoke = new Button { Text = "撤销选中设备", AutoSize = true }; revoke.Click += (_, _) => { if (devices.SelectedItem is Device device && MessageBox.Show(this, "撤销「" + device.Name + "」的手机权限？", "确认", MessageBoxButtons.YesNo) == DialogResult.Yes) pairing.Revoke(device.Id); }; root.Controls.Add(revoke);
-        root.Controls.Add(new Label { Text = "手机与电脑需登录 Tailscale。只监听私网，不开启公网访问。\n关闭窗口后仍在托盘运行；退出桥接不影响 Codex。", Width = 550, Height = 60 });
+        root.Controls.Add(new Label { Text = "手机与电脑在同一局域网即可连接；Tailscale 用于外出访问。\n只监听私网，仍需扫码和电脑确认。关闭窗口后在托盘运行。", Width = 550, Height = 60 });
         tray = new NotifyIcon { Icon = SystemIcons.Application, Text = "Codex 远程控制", Visible = true };
         var menu = new ContextMenuStrip(); menu.Items.Add("显示配对窗口", null, (_, _) => ShowWindow()); menu.Items.Add("退出桥接", null, (_, _) => { exiting = true; Close(); }); tray.ContextMenuStrip = menu; tray.DoubleClick += (_, _) => ShowWindow();
         Shown += (_, _) => { RefreshPair(); RefreshDevices(); }; FormClosing += (_, e) => { if (!exiting && e.CloseReason == CloseReason.UserClosing) { e.Cancel = true; Hide(); } };
         pairing.Changed += () => { if (IsHandleCreated) BeginInvoke(RefreshDevices); };
-        timer.Tick += (_, _) => { address.Text = Endpoint.Length == 0 ? "未发现 Tailscale 地址：请连接 Tailscale 后退出并重开桥接。" : Endpoint + " · 配对码剩余 " + Math.Max(0, (int)(expires - DateTimeOffset.UtcNow).TotalSeconds) + " 秒"; status.Text = failure.Length > 0 ? failure : desktop.Connected ? (desktop.Compatible ? "已接入原 Codex 桌面实例 · " + desktop.CompatibilityNote + "\n" : "桌面已连接，正在检查原生协议\n") + desktop.LastError : desktop.LastError; if (DateTimeOffset.UtcNow >= expires && qr.Image != null) { qr.Image.Dispose(); qr.Image = null; code = ""; } }; timer.Start();
+        timer.Tick += (_, _) => { address.Text = Endpoint.Length == 0 ? "尚无可用私网地址：连接 Wi-Fi／网线或 Tailscale 后会自动检测。" : Endpoint + " · 配对码剩余 " + Math.Max(0, (int)(expires - DateTimeOffset.UtcNow).TotalSeconds) + " 秒"; status.Text = failure.Length > 0 ? failure : desktop.Connected ? (desktop.Compatible ? "已接入原 Codex 桌面实例 · " + desktop.CompatibilityNote + "\n" : "桌面已连接，正在检查原生协议\n") + desktop.LastError : desktop.LastError; if (DateTimeOffset.UtcNow >= expires && qr.Image != null) { qr.Image.Dispose(); qr.Image = null; code = ""; } }; timer.Start();
     }
     void ShowWindow() { Show(); WindowState = FormWindowState.Normal; Activate(); }
     public void SetError(string value) { if (IsHandleCreated) BeginInvoke(() => { failure = value; }); }
+    public void SetNetworks(NetworkEndpoint[] endpoints)
+    {
+        if (!IsHandleCreated) return;
+        BeginInvoke(() => {
+            var previous = Endpoint.Length > 0 ? Endpoint : preferredAddress; networks.Items.Clear(); networks.Items.AddRange(endpoints);
+            var index = Array.FindIndex(endpoints, e => e.Url == previous);
+            networks.SelectedIndex = index >= 0 ? index : endpoints.Length > 0 ? 0 : -1;
+            failure = ""; RefreshPair();
+        });
+    }
     void RefreshDevices() { devices.Items.Clear(); devices.Items.AddRange(pairing.Devices); }
     void RefreshPair()
     {
         qr.Image?.Dispose(); qr.Image = null;
+        code = "";
         if (Endpoint.Length == 0) return;
         code = pairing.CreateQr(Endpoint); expires = DateTimeOffset.UtcNow.AddMinutes(5);
         using var generator = new QRCodeGenerator(); using var data = generator.CreateQrCode(code, QRCodeGenerator.ECCLevel.M); using var png = new PngByteQRCode(data);

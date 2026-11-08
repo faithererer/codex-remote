@@ -106,9 +106,9 @@ private fun Console(repo: Repository, incoming: ThreadKey?, consumeIncoming: () 
             when (screen) {
                 "pair" -> Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(22.dp), verticalArrangement = Arrangement.spacedBy(18.dp)) {
                     Text("一台电脑，一份信任。", style = MaterialTheme.typography.headlineLarge)
-                    Text("电脑运行 CodexRemote.exe，手机与电脑都连接 Tailscale。扫码后，还需要在电脑上确认。", color = Color(0xFF56645A))
-                    Text("若手机正在使用 Clash 等 VPN，请先切换到 Tailscale；仅安装但未连接是不够的。", style = MaterialTheme.typography.bodySmall)
-                    OutlinedButton(onClick = { val launch = context.packageManager.getLaunchIntentForPackage("com.tailscale.ipn"); if (launch != null) context.startActivity(launch) else repo.message.value = "请先安装并登录 Tailscale" }, enabled = !pairing) { Text("打开 Tailscale") }
+                    Text("电脑运行 CodexRemote.exe，同一 Wi-Fi／局域网可直接扫码，无需 Tailscale。请在电脑选择局域网地址，扫码后再在电脑确认。", color = Color(0xFF56645A))
+                    Text("外出访问时可选 Tailscale。已经配对的电脑，可在“我的电脑 → 修改连接地址”切换网络，保留原信任与草稿。", style = MaterialTheme.typography.bodySmall)
+                    OutlinedButton(onClick = { val launch = context.packageManager.getLaunchIntentForPackage("com.tailscale.ipn"); if (launch != null) context.startActivity(launch) else repo.message.value = "同一局域网不需要 Tailscale；外出访问时再安装并连接" }, enabled = !pairing) { Text("外出时打开 Tailscale（可选）") }
                     FilledTonalButton(onClick = scan, enabled = !pairing, modifier = Modifier.fillMaxWidth().height(56.dp)) { Icon(Icons.Outlined.QrCodeScanner, null); Spacer(Modifier.width(10.dp)); Text("扫描电脑配对码") }
                     OutlinedTextField(value = pairingText, onValueChange = { pairingText = it }, label = { Text("也可以粘贴电脑复制的配对码") }, modifier = Modifier.fillMaxWidth().heightIn(min = 120.dp, max = 200.dp), enabled = !pairing)
                     Button(onClick = { scope.launch { pairing = true; try { val name = repo.pair(pairingText); pairingText = ""; repo.message.value = "已连接 $name"; screen = "home" } catch (e: Exception) { repo.message.value = connectionMessage(e) } finally { pairing = false } } }, enabled = !pairing && pairingText.isNotBlank(), modifier = Modifier.fillMaxWidth().height(52.dp)) { if (pairing) { CircularProgressIndicator(Modifier.size(20.dp), color = Color.White, strokeWidth = 2.dp); Spacer(Modifier.width(12.dp)) }; Text(if (pairing) "请在电脑上确认…" else "核对并配对") }
@@ -177,18 +177,21 @@ private fun HomeScreen(hosts: List<HostState>, repo: Repository, background: Boo
 private fun HostsScreen(hosts: List<HostState>, repo: Repository, add: () -> Unit) {
     var editing by remember { mutableStateOf<HostState?>(null) }; var name by remember { mutableStateOf("") }; var removing by remember { mutableStateOf<HostState?>(null) }; var unlock by remember { mutableStateOf<HostState?>(null) }
     var licenses by remember { mutableStateOf(false) }
+    var connection by remember { mutableStateOf<Host?>(null) }
     val context = LocalContext.current
     LazyColumn(contentPadding = PaddingValues(18.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
         item { Button(onClick = add, modifier = Modifier.fillMaxWidth().height(52.dp)) { Icon(Icons.Outlined.Add, null); Text("添加另一台电脑") } }
         items(hosts, key = { it.host.id }) { h -> Card(colors = CardDefaults.cardColors(containerColor = Color.White)) { Column(Modifier.padding(18.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) { Text(h.host.name, style = MaterialTheme.typography.titleLarge, modifier = Modifier.weight(1f)); Switch(checked = h.host.followed, onCheckedChange = { repo.follow(h.host.id, it) }) }
-            Text(if (h.online) "在线 · ${h.threads.size} 个最近会话" else h.error, color = Forest); Text(h.host.url, fontFamily = FontFamily.Monospace, fontSize = 12.sp)
+            Text(if (h.online) "在线 · ${h.threads.size} 个最近会话" else h.error, color = Forest); Text("${connectionKind(h.host.url)} · ${h.host.url}", fontFamily = FontFamily.Monospace, fontSize = 12.sp)
             Text("证书 ${h.host.fingerprint.take(16)}…", fontSize = 11.sp)
+            TextButton(onClick = { connection = h.host }) { Icon(Icons.Outlined.Lan, null, Modifier.size(16.dp)); Spacer(Modifier.width(6.dp)); Text("修改连接地址") }
             Row { TextButton(onClick = { editing = h; name = h.host.name }) { Text("改名") }; TextButton(onClick = { removing = h }) { Text("移除") }; TextButton(onClick = { unlock = h }) { Text("核对未确认操作") } }
         } } }
         item { Text("取消关注只停止这台电脑的连接；移除会删除手机信任。要永久撤销手机权限，请同时在那台电脑桥接窗口撤销配对。", fontSize = 13.sp) }
         item { TextButton(onClick = { licenses = true }) { Text("开源许可 · ${BuildConfig.VERSION_NAME}", fontSize = 12.sp) } }
     }
+    connection?.let { host -> ConnectionAddressDialog(host, repo) { connection = null } }
     if (licenses) {
         val text = remember { listOf("THIRD-PARTY-NOTICES.md", "CommonMark-LICENSE.txt", "Apache-2.0.txt").joinToString("\n\n") { file -> context.assets.open("licenses/$file").bufferedReader().use { it.readText() } } }
         TextDetail("开源许可", text, monospace = false) { licenses = false }

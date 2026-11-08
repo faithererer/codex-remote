@@ -12,7 +12,7 @@
             <intent-filter><action android:name="android.intent.action.MAIN" /><category android:name="android.intent.category.LAUNCHER" /></intent-filter>
         </activity>
         <service android:name=".MonitorService" android:exported="false" android:foregroundServiceType="specialUse">
-            <property android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE" android:value="User-started persistent private Tailscale connections to monitor tasks on the user's paired computers; stopped by the user in the app or notification." />
+            <property android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE" android:value="User-started persistent encrypted LAN or private Tailscale connections to monitor tasks on the user's paired computers; stopped by the user in the app or notification." />
         </service>
     </application>
 </manifest>
