@@ -48,6 +48,11 @@ Windows 自测使用独立临时 DPAPI 目录。API 测试不执行真实发送�
 
 ## CI
 
-CI 运行源码敏感信息模式检查、Android debug 构建／JVM 测试／lint，以及 Windows
-release 构建／隔离自测。CI 没有 Tailscale 设备、真实聊天、维护者签名私钥或手机配对数据。
-因此 CI 成功不能替代上述真机、两台 PC 或安全验收。
+普通 CI 运行源码敏感信息模式检查、Android debug 构建／JVM 测试／lint，以及 Windows
+release 构建／隔离自测；通过后保存可下载的 Android 调试 APK。
+Android Release 工作流独立使用仓库 Secrets 恢复原签名，完成 release 构建／测试／lint
+和原发行证书核对后自动上传 APK 到 Releases；缺少签名配置时停止发布。
+配置与下载入口见 `BUILDING.md`。
+
+Actions 没有 Tailscale 设备、真实聊天或手机配对数据，因此构建与签名成功不能替代上述
+真机、两台 PC 或安全验收。

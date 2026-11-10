@@ -42,7 +42,42 @@ gradle -p android assembleRelease testReleaseUnitTest lintRelease --console=plai
 
 产物为 `android/app/build/outputs/apk/release/app-release.apk`。
 完成后清除当前终端中的密码变量，不把密钥、密码或 `local.properties` 提交到 Git。
-仓库 CI 不需要也不持有维护者的 release 私钥。
+普通 CI 不需要发布私钥；签名发布工作流通过 GitHub Secrets 在临时目录恢复密钥，结束后删除。
+
+## 从 GitHub Actions 下载与发布 APK
+
+每次推送 `main` 或运行 **Actions → Build and Test**，Android 编译、单元测试和 lint
+通过后都会保存 `codex-remote-android-debug-<提交号>`。打开该次运行，在 Artifacts
+下载并解压，即可取得 `app-debug.apk`；运行摘要也有下载链接，产物保留 14 天。
+调试 APK 使用开发签名，不能覆盖正式发行版；不要卸载带有配对数据的正式版来安装它。
+
+正式 APK 使用 **Actions → Android Release**。先由维护者在
+**Settings → Secrets and variables → Actions** 配置两个仓库 Secret：
+
+| Secret | 内容 |
+| --- | --- |
+| `CODEX_SIGNING_STORE_BASE64` | 原发行 keystore 文件的 Base64 内容 |
+| `CODEX_SIGNING_PASSWORD` | 原 keystore 和密钥密码，别名仍为 `codex-remote` |
+
+在保存原签名文件的电脑上，可以直接通过 GitHub CLI 上传，不把密钥或密码发到聊天、
+Issue、工作流日志或源码中：
+
+```powershell
+[Convert]::ToBase64String([IO.File]::ReadAllBytes('D:\签名文件目录\release.jks')) |
+  gh secret set CODEX_SIGNING_STORE_BASE64 --repo faithererer/codex-remote
+gh secret set CODEX_SIGNING_PASSWORD --repo faithererer/codex-remote
+```
+
+第二条命令在终端提示输入密码。Base64 只是传输编码，文件仍是私钥，交给 GitHub Secrets 保存。
+
+推送 `v0.1.5` 这样的版本标签会自动签名发布；已有标签可以在 **Android Release → Run workflow**
+填写 `v0.1.5` 补发。工作流构建标签对应的代码，检查标签与 `versionName` 一致、存在对应
+`docs/RELEASE-<版本>.md`，并在 release 构建／单元测试／lint 通过后验证 APK 签名。
+签名必须与 `docs/VERIFICATION.md` 记录的原发行证书一致；缺少 Secret 或证书不符会停止发布。
+
+成功后 APK 自动加入对应 GitHub Release，并更新 `SHA256SUMS.txt`，保留同一发布中
+已有 Windows／源码文件的校验条目。对应 Release 的说明会采用该标签中的版本说明。
+签名产物也保留为 Actions artifact 30 天；工作流不安装到手机、不操作真实会话。
 
 ## Windows 便携程序
 

@@ -40,6 +40,24 @@ jobs:
           gradle-version: '8.13'
       - run: sdkmanager "platforms;android-35" "build-tools;35.0.0"
       - run: gradle -p android assembleDebug testDebugUnitTest lintDebug --no-daemon --console=plain
+      - name: Save Android debug APK
+        id: apk
+        uses: actions/upload-artifact@v4
+        with:
+          name: codex-remote-android-debug-${{ github.sha }}
+          path: android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 14
+      - name: Explain APK download and signing
+        env:
+          ARTIFACT_URL: ${{ steps.apk.outputs.artifact-url }}
+        run: |
+          {
+            echo '### Android 调试 APK'
+            echo "[下载本次构建的 APK 压缩包]($ARTIFACT_URL)，解压后得到 app-debug.apk。"
+            echo '这是开发签名，不能覆盖正式发行 APK；不要卸载带有配对数据的正式版来安装它。'
+            echo '正式更新使用 Android Release 工作流，需要配置原发行者签名的 GitHub Secrets。'
+          } >> "$GITHUB_STEP_SUMMARY"
 
   windows:
     runs-on: windows-latest
