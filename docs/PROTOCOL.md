@@ -11,6 +11,8 @@ HTTPS/WSS，默认端口 48761。只有 `/api/v1/pair` 不要求 Bearer 设备�
 | GET `/api/v1/threads/{threadId}` | 原会话历史、实时状态、输入请求和可显示执行结果 |
 | GET `/api/v1/threads/{threadId}/fork-context` | 本机原会话的已确认工作目录、轮次、Fork 及工作树可用性 |
 | GET `/api/v1/threads/{threadId}/models` | 原会话模型／强度和本机提供商的可验证配置目录，不包含账号密钥 |
+| POST `/api/v1/threads/{threadId}/images/{uploadId}` | 有界图片暂存，绑定电脑／实例／会话／手机，不执行任务 |
+| GET `/api/v1/threads/{threadId}/images/{imageId}` | 只读取原会话明确引用的图片 |
 | WSS `/api/v1/events?instance=...&after=...` | 每台电脑一条复用事件流；支持有界续传及 reset |
 | POST `/api/v1/operations` | 有限类型的控制请求，不是任意 RPC 入口 |
 | GET `/api/v1/operations/{operationId}` | 查询已持久化操作结果，不重新执行 |
@@ -23,7 +25,7 @@ hostId 来自每台电脑本地持久化身份，不使用电脑名或 IP。inst
 
 事件队列有界；缓存丢失、过旧游标、实例改变、慢消费者队列溢出时，重新读取真实状态。不同电脑连接的事件、身份、凭据、草稿、历史和操作锁定按 hostId 隔离。通知目的地使用 hostId/threadId 的完整身份，不依赖标题。
 
-本机适配器只有桌面目录／历史／项目读取、打开原会话、新建本地会话、Fork 原会话、原会话 follower 操作的固定允许列表。不会提供远程工具枚举、通用 MCP 调用、shell、文件写入或原始 app-server 端口。
+本机适配器只有桌面目录／历史／项目读取、打开原会话、新建本地会话、Fork 原会话、原会话 follower 操作和受限图片附件的固定允许列表。不会提供远程工具枚举、通用 MCP 调用、shell、任意文件读写或原始 app-server 端口。
 
 ## 0.1.1 展示字段（向后兼容）
 
@@ -76,3 +78,12 @@ Fork 同样在派发前持久化意图，派发后异常保留 uncertain。same-
 手机修改连接地址不调用配对或控制接口。先用新地址访问 `/status`，沿用原证书固定与设备凭证，再核对 hostId 和接口版本，成功才写入该电脑的地址。失败保留原地址。手机关闭旧连接并丢弃其迟到事件／状态，重新读取真实会话，未确认操作仍查询原 operationId；不清锁、不重发、不自动改用另一台电脑。
 
 监听地址变化时重建网络监听，但不重启 Codex、不生成新身份或主动清除事件实例。只有原来的桥接／后端实例生命周期会改变 instanceId。地址发现不使用 DNS、广播、中央服务器或任意公网地址；IPv6、主机名和公网形式的局域网地址暂未支持。
+
+## 0.1.6 图片附件
+
+- `POST /api/v1/threads/{threadId}/images/{uploadId}?hostId=...&instanceId=...`：已配对手机上传原始图片字节。uploadId 为 UUID，最多 10 MB，只为这台电脑／实例／会话／手机暂存；重复 ID 的内容及所属范围必须一致。无需执行聊天操作。除该端点外原 JSON 请求上限仍为 192 KiB。
+- `send`／`steer` 操作增加可选 `imageIds`（最多 5 个、不重复）。桥接根据已配对手机取回本机附件，构造原生 localImage 输入及桌面附件上下文；沿用原持久化 operationId 去重、目标轮次校验和未知结果保护。编辑、新建、模型等操作不能夹带图片。
+- 标准消息可含 `images: [{id, name}]`。id 是由源计算的不可逆标识；不在会话 JSON 中发送图片字节、data URL 或下载路径。只有原会话当前快照实际引用的图片才能读取。
+- `GET /api/v1/threads/{threadId}/images/{imageId}?hostId=...&instanceId=...`：固定证书及设备凭证下读取该会话图片。重新核对实例、会话引用、实际图片格式与尺寸，禁用缓存和 MIME 嗅探。不接受客户端文件路径，不访问外网图片，不提供原始协议代理。
+
+原生调用仍为 thread-follower-start-turn v2 和 thread-follower-steer-turn v1。加入 localImage 时附带 restoreMessage 的 imageAttachments 与 attachments，未指定模型／提供商／权限／沙箱覆盖。未用于发送的暂存附件 24 小时后在上传时清理，已发送／未知结果的附件保留。详细存储及容量说明见 IMAGES.md。

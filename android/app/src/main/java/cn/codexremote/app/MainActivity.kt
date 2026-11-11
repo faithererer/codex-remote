@@ -7,6 +7,8 @@ import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.background
@@ -207,6 +209,17 @@ private fun ThreadScreen(key: ThreadKey, repo: Repository, host: HostState?) {
     var draft by remember(key) { mutableStateOf(repo.draft(key)) }; var busy by remember(key) { mutableStateOf(false) }; var stopConfirm by remember { mutableStateOf(false) }
     var latestRequest by remember(key) { mutableIntStateOf(0) }
     var modelDialog by remember(key) { mutableStateOf(false) }; var editTarget by remember(key) { mutableStateOf<JSONObject?>(null) }
+    var selectedImages by remember(key) { mutableStateOf(repo.imageDrafts.list(key)) }
+    var pickerTarget by remember { mutableStateOf<ThreadKey?>(null) }
+    val imagePicker = rememberLauncherForActivityResult(ActivityResultContracts.PickMultipleVisualMedia(MAX_IMAGES)) { uris ->
+        val target = pickerTarget; pickerTarget = null
+        if (target == null || uris.isEmpty()) busy = false
+        else scope.launch {
+            try { val added = repo.imageDrafts.add(target, uris); if (target == key) selectedImages = added }
+            catch (e: Exception) { repo.message.value = e.message ?: "无法添加图片" }
+            finally { busy = false }
+        }
+    }
     DisposableEffect(key) { repo.watch(key); onDispose { repo.unwatch(key) } }
     val active = view?.optString("activeTurnId").orEmpty(); val live = view?.optBoolean("live", true) == true
     val enabled = host?.online == true && host.compatible && view != null && live && !busy
@@ -214,7 +227,7 @@ private fun ThreadScreen(key: ThreadKey, repo: Repository, host: HostState?) {
         if (busy) return
         busy = true
         scope.launch {
-            try { repo.message.value = repo.operate(key, type, fields); if (type == "send" || type == "steer") { if (draft == fields.optString("text")) { draft = ""; repo.draft(key, "") }; latestRequest++ }; if (type == "edit") latestRequest++; success() }
+            try { repo.message.value = repo.operate(key, type, fields); if (type == "send" || type == "steer") { if (draft == fields.optString("text")) { draft = ""; repo.draft(key, "") }; selectedImages = repo.imageDrafts.list(key); latestRequest++ }; if (type == "edit") latestRequest++; success() }
             catch (e: Exception) { repo.message.value = e.message ?: "未能发送；请刷新核对" }
             finally { busy = false }
         }
@@ -224,17 +237,22 @@ private fun ThreadScreen(key: ThreadKey, repo: Repository, host: HostState?) {
             if (!live) TextButton(onClick = { operate("activate") }, enabled = host?.online == true && host.compatible && !busy) { Text("在电脑打开这个现有会话并接入", fontSize = 12.sp) }
             if (host?.online != true) Text("电脑离线：仅保存草稿，不会排队发送", color = Color(0xFF9A4F17), fontSize = 11.sp)
         }
-        ConversationTimeline(key, view, Modifier.weight(1f), latestRequest, { turn -> repo.markRead(key, turn) }) { request -> RequestCard(request, enabled, { fields -> operate("decision", fields) }, { fields -> operate("answer", fields) }) }
+        ConversationTimeline(key, view, Modifier.weight(1f), latestRequest, { turn -> repo.markRead(key, turn) }, images = { message ->
+            val instance = view?.optString("instanceId").orEmpty()
+            ChatImages(message, "${key.hostId}/${key.threadId}/$instance") { id -> repo.image(key, instance, id) }
+        }) { request -> RequestCard(request, enabled, { fields -> operate("decision", fields) }, { fields -> operate("answer", fields) }) }
         Column(Modifier.fillMaxWidth().background(Paper).imePadding().padding(horizontal = 10.dp, vertical = 5.dp)) {
             LatestFilesButton(view)
             LatestThought(view, active.isNotEmpty(), enabled) { stopConfirm = true }
+            DraftImages(selectedImages, "${key.hostId}/${key.threadId}/draft", !busy, { id -> kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { repo.imageDrafts.bytes(key, id) } }) { id -> repo.imageDrafts.remove(key, setOf(id)); selectedImages = repo.imageDrafts.list(key) }
             Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                 TextButton(onClick = { modelDialog = true }, enabled = enabled, contentPadding = PaddingValues(horizontal = 5.dp, vertical = 0.dp), modifier = Modifier.heightIn(min = 32.dp).weight(1f)) { Text(view?.optString("model")?.substringAfterLast('/')?.ifBlank { "选择模型" } ?: "选择模型", fontSize = 11.sp, maxLines = 1, overflow = TextOverflow.Ellipsis); Icon(Icons.Outlined.ExpandMore, "切换模型", Modifier.size(15.dp)) }
                 TextButton(onClick = { editTarget = view?.optJSONObject("editTarget")?.let { JSONObject(it.toString()).put("instanceId", view.optString("instanceId")) } }, enabled = enabled && view?.optJSONObject("editTarget") != null, contentPadding = PaddingValues(horizontal = 5.dp, vertical = 0.dp), modifier = Modifier.heightIn(min = 32.dp)) { Icon(Icons.Outlined.Edit, null, Modifier.size(13.dp)); Text("编辑最新消息", fontSize = 11.sp) }
             }
             Row(verticalAlignment = Alignment.Bottom, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                IconButton(onClick = { pickerTarget = key; busy = true; imagePicker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)) }, enabled = !busy && selectedImages.size < MAX_IMAGES, modifier = Modifier.size(40.dp)) { Icon(Icons.Outlined.AddPhotoAlternate, "添加图片") }
                 OutlinedTextField(draft, { draft = it; repo.draft(key, it) }, placeholder = { Text(if (active.isNotEmpty()) "追加指示…" else "发送指令…", fontSize = 14.sp) }, textStyle = MaterialTheme.typography.bodyMedium, modifier = Modifier.weight(1f).heightIn(max = 120.dp), shape = RoundedCornerShape(14.dp), maxLines = 4)
-                FilledIconButton(onClick = { operate(if (active.isEmpty()) "send" else "steer", JSONObject().put("text", draft)) }, enabled = enabled && draft.isNotBlank(), modifier = Modifier.size(48.dp)) { if (busy) CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp) else Icon(Icons.AutoMirrored.Outlined.Send, "发送") }
+                FilledIconButton(onClick = { operate(if (active.isEmpty()) "send" else "steer", JSONObject().put("text", draft).put("draftImageIds", JSONArray(selectedImages.map { it.id }))) }, enabled = enabled && (draft.isNotBlank() || selectedImages.isNotEmpty()), modifier = Modifier.size(48.dp)) { if (busy) CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp) else Icon(Icons.AutoMirrored.Outlined.Send, "发送") }
             }
         }
     }

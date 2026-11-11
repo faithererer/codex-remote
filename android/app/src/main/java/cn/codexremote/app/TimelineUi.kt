@@ -36,7 +36,7 @@ private val Muted = Color(0xFF647168)
 private val Red = Color(0xFFAC3529)
 
 @Composable
-fun ConversationTimeline(thread: ThreadKey, view: JSONObject?, modifier: Modifier = Modifier, latestRequest: Int = 0, read: (String) -> Unit = {}, requestCard: @Composable (JSONObject) -> Unit) {
+fun ConversationTimeline(thread: ThreadKey, view: JSONObject?, modifier: Modifier = Modifier, latestRequest: Int = 0, read: (String) -> Unit = {}, images: @Composable (JSONObject) -> Unit = {}, requestCard: @Composable (JSONObject) -> Unit) {
     val messages = view?.optJSONArray("messages")?.objects().orEmpty()
     val entries = remember(view) { timelineEntries(messages) }
     val requests = view?.optJSONArray("requests")?.objects().orEmpty()
@@ -76,7 +76,7 @@ fun ConversationTimeline(thread: ThreadKey, view: JSONObject?, modifier: Modifie
             items(requests.asReversed(), key = { "request/" + it.optString("id") }) { requestCard(it) }
             items(entries.asReversed(), key = { it.id }) { entry ->
                 if (entry.message != null) {
-                    if (entry.message.optString("kind") in setOf("fileChange", "diff")) FileChangeCard(entry.message) else ConversationMessage(entry.message)
+                    if (entry.message.optString("kind") in setOf("fileChange", "diff")) FileChangeCard(entry.message) else ConversationMessage(entry.message, images)
                 } else ExecutionGroup(entry)
             }
             if (view == null) item(key = "loading") { LinearProgressIndicator(Modifier.fillMaxWidth()); Text("正在读取原桌面会话…", fontSize = 12.sp) }
@@ -94,7 +94,7 @@ fun ConversationTimeline(thread: ThreadKey, view: JSONObject?, modifier: Modifie
 }
 
 @Composable
-private fun ConversationMessage(message: JSONObject) {
+private fun ConversationMessage(message: JSONObject, images: @Composable (JSONObject) -> Unit) {
     val kind = message.optString("kind")
     val user = kind in setOf("user", "userMessage", "steeringUserMessage")
     val text = message.optString("text")
@@ -108,6 +108,7 @@ private fun ConversationMessage(message: JSONObject) {
         if (!user && kind != "error") MarkdownText(text, Modifier.padding(top = 5.dp))
         else SelectionContainer { Text(text, fontSize = 14.sp, lineHeight = 21.sp, color = if (user) Color.White else Color(0xFF1D2A23), modifier = Modifier.padding(top = 4.dp), maxLines = if (longInput) 7 else Int.MAX_VALUE, overflow = TextOverflow.Ellipsis) }
         if (longInput) Text("查看完整消息", fontSize = 11.sp, color = Color(0xFFD2F56D), modifier = Modifier.clickable { detail = true }.padding(top = 5.dp))
+        images(message)
     }
     if (detail) TextDetail("你的消息", text) { detail = false }
 }

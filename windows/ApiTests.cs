@@ -89,6 +89,20 @@ static class ApiTests
                     Check(foreign.StatusCode == HttpStatusCode.Conflict && stale.StatusCode == HttpStatusCode.Conflict);
                 }
             });
+            await Test("Image endpoints require pairing and reject foreign hosts or stale instances", async () => {
+                var path = "/api/v1/threads/11111111-1111-4111-8111-111111111111/images/" + Guid.NewGuid();
+                using var stranger = Client(ia, 48762); using var denied = await stranger.GetAsync(path); Check(denied.StatusCode == HttpStatusCode.Unauthorized);
+                using var foreign = await a.PostAsync(path + "?hostId=" + ib.HostId + "&instanceId=" + ea.InstanceId, new ByteArrayContent([1])); Check(foreign.StatusCode == HttpStatusCode.Conflict);
+                using var stale = await a.GetAsync(path + "?hostId=" + ia.HostId + "&instanceId=stale"); Check(stale.StatusCode == HttpStatusCode.Conflict);
+            });
+            await Test("Image upload rejects oversized content before touching Codex", async () => {
+                var path = "/api/v1/threads/11111111-1111-4111-8111-111111111111/images/" + Guid.NewGuid() + "?hostId=" + ia.HostId + "&instanceId=" + ea.InstanceId;
+                using var request = new HttpRequestMessage(HttpMethod.Post, path) { Content = new ByteArrayContent(new byte[Images.MaxBytes + 1]) }; request.Headers.ExpectContinue = true;
+                using var large = await a.SendAsync(request); Check(large.StatusCode == HttpStatusCode.RequestEntityTooLarge);
+            });
+            await Test("Images cannot be smuggled into edit create or model operations", async () => {
+                foreach (var type in new[] { "edit", "create", "model" }) { using var response = await Post(a, "/api/v1/operations", J.Node(new { hostId = ia.HostId, instanceId = ea.InstanceId, threadId = type == "create" ? "" : Guid.NewGuid().ToString(), operationId = Guid.NewGuid(), type, imageIds = new[] { Guid.NewGuid() } })); Check(response.StatusCode == HttpStatusCode.BadRequest); }
+            });
             await Test("No arbitrary model RPC endpoint is exposed", async () => { using var response = await Post(a, "/api/v1/rpc", J.Node(new { method = "model/list" })); Check(response.StatusCode == HttpStatusCode.NotFound); });
             await Test("WSS subscription multiplexes host events", async () =>
             {

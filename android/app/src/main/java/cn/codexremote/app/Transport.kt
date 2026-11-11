@@ -124,6 +124,25 @@ class HostApi(val host: Host) {
         val url = (host.url + "/api/v1/events?instance=$instance&after=$after").replaceFirst("https://", "wss://")
         return client.newWebSocket(Request.Builder().url(url).header("Authorization", "Bearer ${host.token}").build(), listener)
     }
+    fun uploadImage(path: String, bytes: ByteArray) {
+        require(path.startsWith("/api/v1/threads/") && bytes.size in 1..MAX_IMAGE_BYTES)
+        val request = Request.Builder().url(host.url + path).header("Authorization", "Bearer ${host.token}").post(bytes.toRequestBody("application/octet-stream".toMediaType())).build()
+        client.newCall(request).execute().use { response ->
+            if (!response.isSuccessful) throw IllegalStateException(runCatching { JSONObject(response.body?.string().orEmpty()).optString("error") }.getOrNull()?.ifBlank { null } ?: "图片上传失败 (${response.code})；请确认电脑桥接已更新")
+        }
+    }
+    fun image(path: String): ByteArray {
+        require(path.startsWith("/api/v1/threads/"))
+        val request = Request.Builder().url(host.url + path).header("Authorization", "Bearer ${host.token}").build()
+        client.newCall(request).execute().use { response ->
+            if (!response.isSuccessful) throw IllegalStateException(runCatching { JSONObject(response.body?.string().orEmpty()).optString("error") }.getOrNull()?.ifBlank { null } ?: "图片暂不可读取 (${response.code})")
+            require(response.header("Content-Type")?.substringBefore(';') in setOf("image/png", "image/jpeg", "image/gif", "image/webp")) { "电脑返回了不支持的图片格式" }
+            val body = response.body ?: error("图片为空"); require(body.contentLength() <= MAX_IMAGE_BYTES) { "图片超过 10 MB" }
+            val output = java.io.ByteArrayOutputStream(); val buffer = ByteArray(32768)
+            body.byteStream().use { stream -> while (true) { val count = stream.read(buffer); if (count < 0) break; require(output.size() + count <= MAX_IMAGE_BYTES) { "图片超过 10 MB" }; output.write(buffer, 0, count) } }
+            return output.toByteArray()
+        }
+    }
     fun close() {
         if (!closing.compareAndSet(false, true)) return
         // TLS shutdown can write to the socket, including when onStop cancels foreground connections.

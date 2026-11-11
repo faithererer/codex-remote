@@ -25,6 +25,7 @@ class RemoteApplication : Application() { lateinit var repository: Repository; o
 class Repository(private val context: Context) {
     val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     val store = SecureStore(context)
+    val imageDrafts = ImageDrafts(context, store)
     val states = MutableStateFlow<Map<String, HostState>>(emptyMap())
     val histories = MutableStateFlow<Map<ThreadKey, JSONObject>>(emptyMap())
     val message = MutableStateFlow("")
@@ -197,6 +198,19 @@ class Repository(private val context: Context) {
         val api = apis[key.hostId] ?: error("电脑未连接")
         val pendingName = "pending-${key.hostId}"; val old = JSONObject(store.get(pendingName, "{}"))
         require(old.length() == 0) { "上次发送结果未确认。请先刷新并核对会话，不会重复发送" }
+        val draftImages = fields.optJSONArray("draftImageIds")?.let { array -> (0 until array.length()).map { array.getString(it) } }.orEmpty()
+        require(draftImages.size <= MAX_IMAGES && draftImages.distinct().size == draftImages.size) { "每条消息最多 5 张不同图片" }
+        body.remove("draftImageIds")
+        if (draftImages.isNotEmpty()) {
+            require(type == "send" || type == "steer") { "此操作不能附带图片" }
+            val uploaded = JSONArray()
+            for (image in draftImages) {
+                val id = imageUploadId(key, host.instance, image)
+                api.uploadImage(imageApiPath(key, host.instance, id), imageDrafts.bytes(key, image)); uploaded.put(id)
+            }
+            require(ownsApi(key.hostId, api) && states.value[key.hostId]?.instance == host.instance) { "连接或电脑实例已变化，图片已保留，请刷新后重新确认" }
+            body.put("imageIds", uploaded)
+        }
         store.put(pendingName, body.toString())
         try {
             val result = api.request("/api/v1/operations", body)
@@ -205,6 +219,7 @@ class Repository(private val context: Context) {
             load(key)
             if (result.optString("status") == "rejected") error(result.optJSONObject("result")?.optString("error") ?: "电脑未接受指令")
             if (type == "model" && result.optJSONObject("result")?.optBoolean("applied") != true) error("电脑模型设置已变化，请刷新后重新选择")
+            if (draftImages.isNotEmpty()) imageDrafts.remove(key, draftImages.toSet())
             "电脑已接收"
         } catch (e: Exception) {
             if (store.get(pendingName, "{}") != "{}") message.value = "发送结果未确认，请核对会话。不会自动重发。"
@@ -299,4 +314,11 @@ class Repository(private val context: Context) {
     fun clearUncertain(id: String) { store.put("pending-$id", "{}"); message.value = "发送锁定已解除；旧指令不会重发。" }
     fun draft(key: ThreadKey) = store.get("draft-${key.hostId}-${key.threadId}", "")
     fun draft(key: ThreadKey, value: String) = store.put("draft-${key.hostId}-${key.threadId}", value)
+    suspend fun image(key: ThreadKey, instance: String, imageId: String): ByteArray = withContext(Dispatchers.IO) {
+        require(states.value[key.hostId]?.instance == instance) { "电脑实例已变化，请刷新会话" }
+        val api = apis[key.hostId] ?: error("电脑未连接")
+        val bytes = api.image(imageApiPath(key, instance, imageId))
+        require(ownsApi(key.hostId, api) && states.value[key.hostId]?.instance == instance) { "电脑连接已变化，请重试" }
+        bytes
+    }
 }

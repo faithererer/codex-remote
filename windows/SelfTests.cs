@@ -11,6 +11,7 @@ static class SelfTests
         void Test(string name, Action action) { try { action(); results.Add(new { name, passed = true }); } catch (Exception e) { results.Add(new { name, passed = false, error = e.Message }); } }
         void Check(bool value) { if (!value) throw new Exception("Assertion failed"); }
         var root = Path.Combine(Path.GetTempPath(), "CodexRemote-test-" + Guid.NewGuid()); var vault = new Vault(root);
+        ImageTests.Run(Test, Check, vault, root);
         Test("Host identity survives restart", () => { Check(Identity.Load(vault).HostId == Identity.Load(vault).HostId); });
         Test("DPAPI roundtrip and no plaintext", () => { vault.Write("test", new { secret = "test-value-do-not-export" }); Check(vault.Read<JsonNode>("test").S("secret") == "test-value-do-not-export"); Check(!System.Text.Encoding.UTF8.GetString(File.ReadAllBytes(Path.Combine(root, "test.dpapi"))).Contains("test-value")); });
         Test("Only Tailscale CGNAT range", () => { Check(Program.Tailnet(IPAddress.Parse("100.64.0.1"))); Check(Program.Tailnet(IPAddress.Parse("100.127.255.254"))); foreach (var ip in new[] { "100.63.255.255", "100.128.0.1", "192.168.1.1", "127.0.0.1", "8.8.8.8", "::1" }) Check(!Program.Tailnet(IPAddress.Parse(ip))); });

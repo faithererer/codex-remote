@@ -4,6 +4,7 @@ using System.Net.WebSockets;
 using System.Text;
 using System.Text.Json.Nodes;
 using Microsoft.AspNetCore.Server.Kestrel.Core;
+using Microsoft.AspNetCore.Http.Features;
 using QRCoder;
 
 namespace CodexRemote;
@@ -115,13 +116,30 @@ static class Program
         app.MapGet("/api/v1/threads/{id}", async (string id) => await desktop.History(id));
         app.MapGet("/api/v1/threads/{id}/fork-context", async (string id) => { var context = await desktop.ForkContext(id); context["hostId"] = identity.HostId; return context; });
         app.MapGet("/api/v1/threads/{id}/models", async (string id) => { var models = await desktop.Models(id); models["hostId"] = identity.HostId; return models; });
+        app.MapPost("/api/v1/threads/{id}/images/{imageId}", async (string id, string imageId, HttpContext context) =>
+        {
+            if (context.Request.Query["hostId"] != identity.HostId || context.Request.Query["instanceId"] != events.InstanceId) throw new ApiError(409, "电脑或实例已变化，请刷新");
+            if (!Guid.TryParseExact(imageId, "D", out _) || !Guid.TryParse(id, out _)) throw new ApiError(400, "图片或会话标识无效");
+            var limit = context.Features.Get<IHttpMaxRequestBodySizeFeature>(); if (limit is { IsReadOnly: false }) limit.MaxRequestBodySize = Images.MaxBytes;
+            if (context.Request.ContentLength > Images.MaxBytes) throw new ApiError(413, "单张图片上限 10 MB");
+            var bytes = await Images.ReadBounded(context.Request.Body, context.RequestAborted);
+            return await desktop.UploadImage(id, context.Request.Query["instanceId"].ToString(), ((Device)context.Items["device"]!).Id, imageId, bytes);
+        });
+        app.MapGet("/api/v1/threads/{id}/images/{imageId}", async (string id, string imageId, HttpContext context) =>
+        {
+            if (context.Request.Query["hostId"] != identity.HostId) throw new ApiError(409, "电脑身份不匹配");
+            var image = await desktop.ReadImage(id, context.Request.Query["instanceId"].ToString(), imageId);
+            context.Response.Headers.XContentTypeOptions = "nosniff";
+            return Results.Bytes(image.Bytes, image.Mime);
+        });
         app.MapGet("/api/v1/operations/{id}", (string id) => operations.Lookup(id) is JsonNode value ? Results.Json(value) : Results.NotFound(new { status = "notFound", warning = "未记录并不代表可以自动重发；请核对会话" }));
-        app.MapPost("/api/v1/operations", async (JsonNode body) =>
+        app.MapPost("/api/v1/operations", async (JsonNode body, HttpContext context) =>
         {
             if (body.S("hostId") != identity.HostId || body.S("instanceId") != events.InstanceId) throw new ApiError(409, "电脑或实例已变化，请刷新后重新确认操作");
             if (body.S("type") == "create") { if (body.S("threadId").Length > 0) throw new ApiError(400, "新建操作不能指定已有会话"); }
             else if (!Guid.TryParse(body.S("threadId"), out _)) throw new ApiError(400, "会话标识无效");
-            return await operations.Run(body, async () => { if (body.S("instanceId") != events.InstanceId) throw new ApiError(409, "实例已变化"); return await desktop.Control(body); });
+            if (body["imageIds"] != null && body.S("type") is not ("send" or "steer")) throw new ApiError(400, "只有发送或追加消息可以附带图片");
+            return await operations.Run(body, async () => { if (body.S("instanceId") != events.InstanceId) throw new ApiError(409, "实例已变化"); return await desktop.Control(body, ((Device)context.Items["device"]!).Id); });
         });
         app.Map("/api/v1/events", async context =>
         {

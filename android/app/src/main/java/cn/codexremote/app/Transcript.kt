@@ -18,7 +18,7 @@ fun timelineEntries(messages: List<JSONObject>): List<TimelineEntry> {
     messages.forEachIndexed { index, message ->
         val kind = message.optString("kind")
         if (kind == "reasoning") return@forEachIndexed
-        if (isConversation(kind) || kind in setOf("fileChange", "diff")) {
+        if (isConversation(kind) || kind in setOf("fileChange", "diff") || (message.optJSONArray("images")?.length() ?: 0) > 0) {
             flush()
             result += TimelineEntry("message/" + message.optString("id").ifEmpty { index.toString() }, message)
         } else executions += message

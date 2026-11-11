@@ -28,6 +28,15 @@ security certification.
   current-user DPAPI. Protect both devices and their signed-in OS accounts.
 - Each PC owns its identity, credentials, history, operation journal and live
   connection. Credentials are not a substitute for protecting a compromised PC.
+- Image uploads are bounded and bound to the device, thread and backend instance.
+  Only the paired phone's staged attachment IDs can enter native image inputs.
+  Viewing resolves opaque IDs against real conversation references, checks image
+  bytes and dimensions, and never accepts a caller-supplied path or proxies an
+  external URL. UNC/network shares and reparse paths are refused. Attachments are
+  stored in the current user's application data, outside project directories;
+  the index uses DPAPI, while image files use OS access protection, not encryption.
+  Uploaded images may remain referenced by desktop history and are retained after
+  dispatch, including uncertain outcomes. See docs/IMAGES.md for quotas/cleanup.
 - Native desktop permissions, tools and sandbox settings remain in effect. The
   mobile bridge does not make an otherwise unsafe Codex instruction safe.
 - The native IPC adapter is an unstable, version-dependent interface. Since

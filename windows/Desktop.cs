@@ -133,8 +133,9 @@ static class StateView
         foreach (var turn in turns)
         {
             var input = string.Join("\n", turn["params"].Array("input").Where(n => n.S("type") == "text").Select(n => n.S("text")));
-            var initialEcho = input.Length > 0 ? InitialUserEcho(turn, input) : null;
-            if (input.Length > 0) all.Add(J.Node(new { id = turn.S("turnId") + "-user", turnId = turn.S("turnId"), kind = "user", text = initialEcho == null ? input : UserText(initialEcho), clientId = turn["params"].S("clientUserMessageId"), nativeId = initialEcho?.S("id") ?? "" }));
+            var inputImages = Images.In(turn["params"], state.S("cwd"));
+            var initialEcho = input.Length > 0 || inputImages.Count > 0 ? InitialUserEcho(turn, input) : null;
+            if (input.Length > 0 || inputImages.Count > 0) all.Add(J.Node(new { id = turn.S("turnId") + "-user", turnId = turn.S("turnId"), kind = "user", text = initialEcho == null ? input : UserText(initialEcho), images = Images.Describe(inputImages.Concat(Images.In(initialEcho, state.S("cwd"))).DistinctBy(i => i.Id)), clientId = turn["params"].S("clientUserMessageId"), nativeId = initialEcho?.S("id") ?? "" }));
             foreach (var item in turn.Array("items").OfType<JsonNode>())
             {
                 if (ReferenceEquals(item, initialEcho)) continue;
@@ -158,7 +159,9 @@ static class StateView
                     "mcpToolCall" => item.S("server") + "/" + item.S("tool") + "\n" + (item["result"]?.ToJsonString(J.Options) ?? item["error"]?.ToJsonString(J.Options) ?? item.S("status")),
                     _ => item.S("text", item.S("status"))
                 };
-                if (text.Length == 0 && type != "fileChange") continue;
+                var images = Images.In(item, state.S("cwd"), text);
+                if (images.Count > 0 && type == "mcpToolCall") text = item.S("server") + "/" + item.S("tool") + "\n" + string.Join("\n", (item["result"] is JsonObject result ? result.Array("content") : []).Where(c => c.S("type") == "text").Select(c => c.S("text")));
+                if (text.Length == 0 && type != "fileChange" && images.Count == 0) continue;
                 bool truncated = text.Length > 20000;
                 var message = J.Node(new { id = item.S("id"), turnId = turn.S("turnId"), kind = type, text = Bounded(text), truncated, status = item.S("status") });
                 if (type == "agentMessage") { message["phase"] = item.S("phase"); message["turnStatus"] = turn.S("status"); }
@@ -170,6 +173,7 @@ static class StateView
                     message["durationMs"] = item["durationMs"]?.Copy();
                 }
                 if (type == "mcpToolCall") message["toolName"] = item.S("server") + "/" + item.S("tool");
+                if (images.Count > 0) message["images"] = Images.Describe(images);
                 if (type == "fileChange") { message["changes"] = Changes(item); message["changesTruncated"] = item.Array("changes").Count > 100; }
                 all.Add(message);
             }
@@ -201,6 +205,24 @@ static class StateView
 
 sealed class Desktop(EventHub events, Vault? vault = null) : IAsyncDisposable
 {
+    readonly ImageUploads? uploads = vault == null ? null : new(vault);
+    public async Task<JsonNode> UploadImage(string thread, string instance, string device, string imageId, byte[] bytes)
+    {
+        if (!Guid.TryParse(thread, out _) || instance != events.InstanceId) throw new ApiError(409, "会话或实例已变化，请刷新");
+        var state = await Snapshot(thread, true); Compatibility.ValidateState(state, thread);
+        if (instance != events.InstanceId) throw new ApiError(409, "实例已变化，请刷新");
+        return (uploads ?? throw new ApiError(503, "图片存储不可用")).Save(imageId, thread, instance, device, bytes);
+    }
+    public async Task<(byte[] Bytes, string Mime)> ReadImage(string thread, string instance, string imageId)
+    {
+        if (!Guid.TryParse(thread, out _) || instance != events.InstanceId) throw new ApiError(409, "会话或实例已变化，请刷新");
+        if (imageId.Length != 64 || imageId.Any(c => !char.IsAsciiHexDigit(c))) throw new ApiError(400, "图片标识无效");
+        var state = await Snapshot(thread, true);
+        var image = Images.InState(state).FirstOrDefault(i => i.Id == imageId) ?? throw new ApiError(404, "图片不在这个会话中或已不在当前历史页");
+        var result = await Images.Read(image);
+        if (instance != events.InstanceId) throw new ApiError(409, "实例已变化，请刷新");
+        return result;
+    }
     readonly object sync = new();
     PipePeer? ipc;
     readonly Dictionary<string, (JsonNode State, long Revision)> states = [];
@@ -360,7 +382,7 @@ sealed class Desktop(EventHub events, Vault? vault = null) : IAsyncDisposable
             return view;
         }
     }
-    public async Task<JsonNode> Control(JsonNode body)
+    public async Task<JsonNode> Control(JsonNode body, string deviceId = "")
     {
         if (!Compatible) throw new ApiError(409, "原桌面协议自检尚未就绪，请稍后刷新；不会使用其他后端代替");
         if (backend.Length == 0 || BackendIdentity() != backend || body.S("instanceId") != events.InstanceId) throw new ApiError(409, "Codex 后端已改变，请重新读取状态");
@@ -420,15 +442,19 @@ sealed class Desktop(EventHub events, Vault? vault = null) : IAsyncDisposable
         else if (type is "send" or "steer")
         {
             var text = body.S("text").Trim();
-            if (text.Length is < 1 or > 32000) throw new ApiError(400, "指令必须为 1 至 32000 字符");
+            if (text.Length > 32000 || text.Length == 0 && body.Array("imageIds").Count == 0) throw new ApiError(400, "请输入文字或选择图片（文字上限 32000 字符）");
             var messageId = body.S("operationId");
-            var input = J.Node(new[] { new { type = "text", text, text_elements = new object[0] } });
+            var images = uploads?.Claim(body, deviceId) ?? new JsonArray();
+            var input = Images.Input(text, images);
+            var attachments = new JsonArray(images.Select(i => J.Node(new { path = i.S("path"), fsPath = i.S("path"), label = Path.GetFileName(i.S("path")), isImageAttachment = true })).ToArray());
+            var restore = J.Node(new { id = messageId, text, createdAt = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(), cwd = state.S("cwd"), context = new { prompt = text, addedFiles = new object[0], imageAttachments = images.Select(i => new { src = new Uri(i.S("path")).AbsoluteUri, localPath = i.S("path"), filename = Path.GetFileName(i.S("path")) }), fileAttachments = new object[0], workspaceRoots = new[] { state.S("cwd") } } });
             if (type == "send")
             {
                 if (active.Length > 0) throw new ApiError(409, "正在运行，请使用追加指示");
                 method = "thread-follower-start-turn"; version = 2;
                 // Omit model/permissions/sandbox overrides: the native desktop inherits its real settings.
                 parameters["turnStart"] = J.Node(new { request = new { threadId = id, clientUserMessageId = messageId, input, turnTrigger = "composer" }, context = new { inheritThreadSettings = true } });
+                if (images.Count > 0) { parameters["turnStart"]!["context"]!["restoreMessage"] = restore; parameters["turnStart"]!["context"]!["attachments"] = attachments; }
             }
             else
             {
@@ -436,7 +462,8 @@ sealed class Desktop(EventHub events, Vault? vault = null) : IAsyncDisposable
                 method = "thread-follower-steer-turn";
                 parameters["input"] = input;
                 parameters["clientUserMessageId"] = messageId;
-                parameters["restoreMessage"] = J.Node(new { id = messageId, text, createdAt = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(), cwd = state.S("cwd"), context = new { prompt = text, addedFiles = new object[0], imageAttachments = new object[0], fileAttachments = new object[0], workspaceRoots = new[] { state.S("cwd") } } });
+                parameters["restoreMessage"] = restore;
+                if (images.Count > 0) parameters["attachments"] = attachments;
             }
         }
         else if (type == "interrupt")
