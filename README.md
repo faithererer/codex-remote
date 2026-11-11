@@ -113,7 +113,7 @@ Windows 在已连接的以太网／Wi-Fi 私有 IPv4 地址及 Tailscale IPv4 �
 
 自测命令：`CodexRemote.exe --self-test result.json`、`--api-test api-result.json`、`--smoke smoke.json`。API 自测在一台 PC 的私网地址临时使用 `48762/48763`，优先局域网，并在两种网络均存在时验证共同身份与去重；不等于两台物理 PC 测试。`--smoke` 只读原桌面，不发送任务指令。
 
-详细构建步骤见 [docs/BUILDING.md](docs/BUILDING.md)，验证范围见 [docs/VERIFICATION.md](docs/VERIFICATION.md)，接口见 [docs/PROTOCOL.md](docs/PROTOCOL.md)。CI 只构建和执行隔离测试，不连接维护者的电脑、不使用发行签名私钥，也不操作真实对话。
+详细构建步骤见 [docs/BUILDING.md](docs/BUILDING.md)，验证范围见 [docs/VERIFICATION.md](docs/VERIFICATION.md)，接口见 [docs/PROTOCOL.md](docs/PROTOCOL.md)。普通 CI 构建、执行隔离测试并保存可下载的 Android 调试 APK；Android Release 工作流配置原签名 Secrets 后，自动构建正式 APK 并发布到 Releases。两条流水线都不连接维护者的电脑或操作真实对话。
 
 ## 开源与反馈
 
